@@ -331,6 +331,26 @@ def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], 
         logger.error(traceback.format_exc())
         return None
 
+def matrix_post_protocol_link(config: LocalConfig, matrixbot: MatrixBot, email_data: Dict[str, str], event_id: str):
+    # beschreibung = email_data['beschreibung']
+    # fragen = email_data['fragen']
+    # anfrage=f"Beschreibung:\n{beschreibung}\n\nFragen:\n{fragen}"
+    # anfrage=requests.utils.quote(anfrage)
+    anfrage=""
+    sender_name=requests.utils.quote(email_data['sender_name'])
+    fachsemester = requests.utils.quote(email_data['fachsemester'])
+    art = requests.utils.quote(email_data['art'])
+    betreuung = requests.utils.quote(email_data['betreuung'])
+    studiengang = requests.utils.quote(email_data['studiengang'])
+    fachgebiet = requests.utils.quote(email_data['fachgebiet'])
+    start_date = email_data['received_date'].replace("T", " ")[:16]
+    logger.info(start_date)
+    start_date = requests.utils.quote(start_date)
+    message_id = requests.utils.quote(email_data['message_id'])
+    msg=f"{config.google_form_link}usp=pp_url&entry.1084327688={anfrage}&entry.1339219203={sender_name}&entry.1526227417={studiengang}&entry.760579146={betreuung}&entry.302223532={fachgebiet}&entry.1573426724={art}&entry.1469014536={fachsemester}&entry.701693485={message_id}&entry.1479923903={start_date}"
+    html_msg=f'<a href="{msg}">{html.escape("Protokoll-Link vorausgefüllt (Google Forms)")}</a>'
+    matrixbot.send_message(msg=msg, thread_reply_to=event_id, html_msg=html_msg)
+
 def process_email(config: LocalConfig, account: Account, message: Message, processed_emails: Set[str], matrixbot: MatrixBot, stats: StatsTableManager) -> bool:
     """Verarbeitet eine einzelne E-Mail."""
     try:
@@ -365,7 +385,7 @@ def process_email(config: LocalConfig, account: Account, message: Message, proce
         raise
 
     matrix_post_detail_thread(matrixbot = matrixbot, email_data = email_data, event_id = event_id)
-
+    matrix_post_protocol_link(config=config, matrixbot=matrixbot, email_data=email_data, event_id=event_id)
     save_processed_email(filename=config.processed_file, message_id=message_id)
     # collect keys and data to be saved in stats.csv
     try:
@@ -386,7 +406,8 @@ def process_many_emails(messages: list, config: LocalConfig, account: Account, p
             try:
                 process_email(config, account, message, processed_emails, matrixbot, stats)
             except Exception as e:
-                logger.error(f"Fehler beim Verarbeiten der E-Mail {message.sender_name}: {e}")
+                logger.error(f"Fehler beim Verarbeiten der E-Mail {message.sender.name}: {e}")
+                import traceback
                 logger.error(traceback.format_exc())
         logger.info(f"Verarbeitung der Mails abgeschlossen.")
     except Exception as e:
