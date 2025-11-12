@@ -4,7 +4,6 @@ import json
 import requests
 import time
 import uuid
-from typing import Optional
 # own stuff: 
 from configuration import Configuration
 
@@ -66,7 +65,7 @@ class MatrixBot:
             logger.exception("Error during parsing of request body after login of the matrix bot.")
             raise
         logger.debug("Matrix Bot erfolgreich eingeloggt mit Passwort.")
-
+        
     def token_whoami(self):
         try:
             response = requests.get(f'{self.homeserver}/_matrix/client/v3/account/whoami',
@@ -88,19 +87,56 @@ class MatrixBot:
             self.access_token=f.read()
         logger.debug("Matrix AccessToken aus Cache Datei gelesen.")
     
-    def send_message(self, msg):
+    def send_message(self, msg, room_id=None, thread_reply_to=None, html_msg=None):
+        """
+        Send Matrix Message to room, optionally reply in thread. 
+        Will try to reauthenticate if response returns 401 status code. 
+
+        Arguments:
+        - msg: String, Message. Markdown formatting possible
+        Optional:
+        - room_id: String, The room id where the message should be sent to. 
+        - thread_reply_to: String, a Matrix event_id of the message to which a thread should be opened or continued. event_ids of messages that are already in a thread will lead to a 400 HTTPError
+        """
         try:
-            room_id = self.room_id
+            if room_id is None:
+                room_id = self.room_id
             randomuuid = str(uuid.uuid4())
             url = f'{self.homeserver}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{randomuuid}'
             headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"}
-            payload = {"msgtype": "m.text", "body": msg}
+            payload = {
+                "msgtype": "m.text",
+                "body": msg}
+            if thread_reply_to is not None: 
+                payload.update({
+                    "m.relates_to": {
+                        "rel_type": "m.thread",
+                        "event_id": thread_reply_to
+                        }
+                })
+            if html_msg is not None:
+                payload.update({
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": html_msg
+                 })
             response = requests.put(url, headers=headers, json=payload, timeout=15)
+            logger.debug(f"Response Text: {response.text}")
             response.raise_for_status()
+            logger.info("Matrix-Bot hat Nachricht gesendet.")
+            return json.loads(response.text)['event_id']
         except requests.exceptions.HTTPError:
             logger.exception("Fehler beim Senden der Nachricht:")
-        try:
-            logger.info("Matrix-Bot hat Nachricht gesendet.")
-            return response.json
-        except Exception:
-            logger.exception("Fehler beim Senden der Nachricht")
+            # in case token expired:
+            if response.status_code == 401:
+                # reauthenticate
+                self.password_login()
+                self.write_token_cache()
+                response = requests.put(url, headers=headers, json=payload, timeout=15)
+                logger.debug(f"Response Text: {response.text}")
+                response.raise_for_status()
+                logger.info("Matrix-Bot hat Nachricht gesendet.")
+            elif response.status_code == 400:
+                logger.error("Möglicherweise wurde im Argument thread_reply_to eine event_id angegeben, die zu einer Nachricht gehört die bereits in einem Thread ist - Matrix erlaubt keine genesteten Threads.")
+                raise
+            else: 
+                raise

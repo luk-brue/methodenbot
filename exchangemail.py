@@ -1,15 +1,29 @@
 import logging
+import os
+import csv
+import quopri
+import re
+import html
+import time
+from datetime import datetime, timezone
+import requests
+from bs4 import BeautifulSoup
+from pprint import pprint, pformat
+import json
+import traceback
+import pandas as pd
 from exchangelib import Configuration, Credentials, Account, DELEGATE, Message
 from exchangelib.services import SubscribeToStreaming
 from exchangelib.properties import NewMailEvent
-from typing import Set, Dict, Optional
+from typing import Set, Dict, Optional, List
 # own stuff:
-from configuration import Configuration
+from configuration import Configuration as LocalConfig
 from stats_table_manager import glimpse, StatsTableManager
+from matrixbot import MatrixBot
 
 logger = logging.getLogger(__name__)
 
-def init_exchange_connection(config: Configuration) -> Account:
+def init_exchange_connection(config: LocalConfig) -> Account:
     """Initialisiert die Verbindung zu Exchange. Sollten hier mit der Konfigurations jemals
      Fehler auftreten, in account() autodiscover auf True setzen und
      config wegnehmen und dafür credentials hineintun. 
@@ -267,7 +281,61 @@ def parse_email_data(item: Message) -> Dict[str, str]:
     #logger.info(f"Parsed data content:{pformat(parsed_data)}")
     return parsed_data
 
-def process_email(config: Configuration, account: Account, message: Message, processed_emails: Set[str], rocket: , stats: StatsTableManager) -> bool:
+def matrix_post_message(matrixbot: MatrixBot, email_data: Dict[str, str]) -> Optional[str]:
+    """Postet eine Message in Rocket Chat"""
+    logger.info("Erstelle Matrix-Nachricht...")
+    # extrahiere Felder aus Dict
+    fachsemester = f"{email_data['fachsemester']}"
+    sender = f"{email_data['sender_name']}"  # Absendername
+    art = f"{email_data['art']}"
+    betreuung = f"{email_data['betreuung']}"
+    studiengang = f"{email_data['studiengang']}"
+    fachgebiet = f"{email_data['fachgebiet']}"
+    #description = f"{pprint(email_data)}"
+    start_date = f"{email_data['received_date']}"
+    # poste Nachricht
+    try:
+        event_id = matrixbot.send_message(
+            msg = f"{sender}\n{art} bei {betreuung} ({fachgebiet})\n{studiengang}, {fachsemester}. FS.",
+            html_msg=f"<b>{sender}</b><br>{art} bei {betreuung} ({fachgebiet})<br>{studiengang}, {fachsemester}. FS."
+            )
+        return event_id
+    except Exception:
+        logger.exception(f"❌ Unerwarteter Fehler bei der Matrix API-Anfrage:")
+        return None
+
+def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], event_id: str) -> Optional[str]:
+    beschreibung = email_data['beschreibung']
+    fragen = email_data['fragen']
+    rskript = email_data['rskript']
+    try:
+        logger.info(f"🚀 Poste Details in Thread unter Nachricht mit ID {event_id}")
+        detailtext=f"Beschreibung:\n{beschreibung}\n\nFragen:\n{fragen}\n\nR-Skript:\n```r\n{rskript}\n```"
+        msg_len = len(detailtext)
+        if msg_len <= 5000:
+            croppedtext = detailtext
+        elif rskript == None: # Don't add closing backticks if Rscript is not there
+            croppedtext = detailtext[:4975] + f"\n[...] {msg_len - 4994} weitere Zeichen"
+        else: # Do add closing backticks if Rscript exists
+            croppedtext = detailtext[:4965] + f"\n[...] {msg_len - 4994} weitere Zeichen\n```"
+        
+        # equalize newline characters (\r\n | \n) -> <br>
+        # escape html < > & signs
+        beschreibung=html.escape(beschreibung)
+        beschreibung='<br>'.join(beschreibung.splitlines())
+        fragen=html.escape(fragen)
+        fragen='<br>'.join(fragen.splitlines())
+
+        html_text = f'<h3>Beschreibung:</h3>{beschreibung}<br><h3>Fragen:</h3>{fragen}<br><h3>R-Skript:</h3><pre><code class="language-r">{html.escape(rskript)}</code></pre>'
+        logger.info(f"Beschreibugn: {beschreibung}")
+        matrixbot.send_message(msg=croppedtext, thread_reply_to=event_id, html_msg=html_text)
+
+    except Exception as e:
+        logger.error(f"❌ Unerwarteter Fehler beim Erstellen des Matrix Threads: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+def process_email(config: LocalConfig, account: Account, message: Message, processed_emails: Set[str], matrixbot: MatrixBot, stats: StatsTableManager) -> bool:
     """Verarbeitet eine einzelne E-Mail."""
     try:
         message_id = message.message_id
@@ -293,40 +361,34 @@ def process_email(config: Configuration, account: Account, message: Message, pro
     email_data = parse_email_data(message)
     # try except weil Matrix Session Tokens ablaufen
     # unbekannt wie lange in unserer Installation gültig.
-    try:
-        msg_id = rc_post_message(config, email_data, rocket = rocket)
-    except RocketAuthenticationException as e:
-        logger.error(f"Fehler bei RocketChat API Authentifizierung - möglicherweise ist Session Token abgelaufen.{e}")
-        rocket_chat_login(config)
-        logger.info("Login wurde erneuert. Versuche RocketChat Message noch mal zu posten:")
-        rc_id = rc_post_message(config, email_data, rocket = rocket)
-    if rc_id is None:
-        logger.error("Fehler - Thread-ID (rc_id) ist None")
+
+    msg_id = matrix_post_message(matrixbot=matrixbot, email_data=email_data)
+
+    if msg_id is None:
+        logger.error("Fehler - Thread-ID ist None")
         raise
-    rc_post_detail_thread(config = config, rocket = rocket, email_data = email_data, rc_id = rc_id)
-    save_processed_email(filename=config.processed_file, message_id=message_id)
+
+    matrix_post_detail_thread(matrixbot = matrixbot, email_data = email_data, event_id = msg_id)
+
+    save_processed_email(filename=config.processed_file, message_id=msg_id)
     # collect keys and data to be saved in stats.csv
     try:
         allowed_keys = set(stats.HEADERS)
         mail_record = {k: v for k, v in email_data.items() if k in allowed_keys}
-        mail_record.update({'tmid': rc_id}) # add the thread message id
+        mail_record.update({'tmid': msg_id}) # add the thread message id
     except Exception as e:
         logger.error("Fehler beim Sammeln der Email-Daten für die Statistik", e)
     stats.append_record(mail_record) # save data to stats.csv
-    rc_post_template(config = config, 
-        rocket = rocket, 
-        email_data = email_data, 
-        rc_id = rc_id)
     return True
 
-def process_many_emails(messages: list, config: Configuration, account: Account, processed_emails: Set[str],
-                    rocket: RocketChat, stats: StatsTableManager):
+def process_many_emails(messages: list, config: LocalConfig, account: Account, processed_emails: Set[str],
+                    matrixbot: MatrixBot, stats: StatsTableManager):
     """Verarbeitet viele E-Mails."""
     try:
         logger.info(f"Verarbeite {len(messages)} E-Mails...")
         for message in messages:
             try:
-                process_email(config, account, message, processed_emails, rocket, stats)
+                process_email(config, account, message, processed_emails, matrixbot, stats)
             except Exception as e:
                 logger.error(f"Fehler beim Verarbeiten der E-Mail {message.message_id}: {e}")
                 import traceback
@@ -361,9 +423,10 @@ def sync_emails(account: Account):
         raise
 
 def maintain_notification_streaming(account: Account,
-                                    config: Configuration,
+                                    config: LocalConfig,
                                     processed_emails: Set[str],
                                     stats: StatsTableManager,
+                                    matrixbot: MatrixBot,
                                     timeout_minutes: int=29,
                                     only_fields = ['headers', 'subject', 'sender', 'datetime_received', 'datetime_sent', 'body', 'message_id']):
     """:params: inbox = Account.inbox
@@ -390,6 +453,7 @@ def maintain_notification_streaming(account: Account,
                                             account=account, 
                                             message=item,
                                             processed_emails=processed_emails,
+                                            matrixbot=matrixbot,
                                             stats=stats)
                             logger.info("📭 Warte auf weitere neue Mails.")
         except (ConnectionError, TimeoutError) as e:  
