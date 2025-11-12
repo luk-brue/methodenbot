@@ -254,11 +254,7 @@ def parse_email_data(item: Message) -> Dict[str, str]:
         rskript = None
     
     beschreibung = results['Kurze Beschreibung des Projekts (Hypothesen, Ablauf, erhobene Variablen, Datenstruktur, geplante Analyse)\n']
-    beschreibung = beschreibung.replace("*", "∗") # multiplication star should not be interpreted as markdown
-    beschreibung = beschreibung.replace(">", "›") # > erzeugt Zitat-Blöcke, › nicht
     fragen = results['Konkreten Fragen + Eigene Lösungsansätze? ° ']
-    fragen = fragen.replace("*", "∗") 
-    fragen = fragen.replace(">", "›")
 
     parsed_data = {
         'sender_name': sender_name,  # Nur den Namen
@@ -362,20 +358,20 @@ def process_email(config: LocalConfig, account: Account, message: Message, proce
     # try except weil Matrix Session Tokens ablaufen
     # unbekannt wie lange in unserer Installation gültig.
 
-    msg_id = matrix_post_message(matrixbot=matrixbot, email_data=email_data)
+    event_id = matrix_post_message(matrixbot=matrixbot, email_data=email_data)
 
-    if msg_id is None:
+    if event_id is None:
         logger.error("Fehler - Thread-ID ist None")
         raise
 
-    matrix_post_detail_thread(matrixbot = matrixbot, email_data = email_data, event_id = msg_id)
+    matrix_post_detail_thread(matrixbot = matrixbot, email_data = email_data, event_id = event_id)
 
-    save_processed_email(filename=config.processed_file, message_id=msg_id)
+    save_processed_email(filename=config.processed_file, message_id=message_id)
     # collect keys and data to be saved in stats.csv
     try:
         allowed_keys = set(stats.HEADERS)
         mail_record = {k: v for k, v in email_data.items() if k in allowed_keys}
-        mail_record.update({'tmid': msg_id}) # add the thread message id
+        mail_record.update({'tmid': event_id}) # add the thread message id
     except Exception as e:
         logger.error("Fehler beim Sammeln der Email-Daten für die Statistik", e)
     stats.append_record(mail_record) # save data to stats.csv
@@ -390,34 +386,11 @@ def process_many_emails(messages: list, config: LocalConfig, account: Account, p
             try:
                 process_email(config, account, message, processed_emails, matrixbot, stats)
             except Exception as e:
-                logger.error(f"Fehler beim Verarbeiten der E-Mail {message.message_id}: {e}")
-                import traceback
+                logger.error(f"Fehler beim Verarbeiten der E-Mail {message.sender_name}: {e}")
                 logger.error(traceback.format_exc())
         logger.info(f"Verarbeitung der Mails abgeschlossen.")
     except Exception as e:
         logger.error(f"Fehler beim Verarbeiten der E-Mails: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise
-
-def sync_emails(account: Account):
-    """
-    Benötigt ein Account-Objekt von exchangelib.
-    Synchronisiert nur neue Emails. Beim ersten Sync wird die gesamte INBOX
-    abgerufen, der Status wird in inbox.item_sync_state gespeichert.
-    """
-    logger.info("Synchronisiere: Hole neue Emails...")
-    inbox = account.inbox
-    messages = []
-    only_fields = ['headers', 'subject', 'sender', 'datetime_received', 'datetime_sent', 'body']
-    try:
-        for change_type, item in inbox.sync_items(only_fields=only_fields):
-            if change_type == "create":
-                messages.append(item)
-        logger.info(f"INBOX enthält {len(messages)} neue Email(s) seit dem letzten Sync.")
-        return messages
-    except Exception as e:
-        logger.error(f"Fehler beim Synchronisieren der Emails: {e}")
         import traceback
         logger.error(traceback.format_exc())
         raise

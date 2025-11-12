@@ -12,7 +12,7 @@ def glimpse(df):
 
 class StatsTableManager:
     """
-    Manages 2 stats tables stored in CSV files.
+    Manages stats table stored in CSV files.
     
     - On init, checks for the files and creates them if missing.
     - Provides methods to append new records and update rows.
