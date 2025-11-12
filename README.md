@@ -42,7 +42,7 @@ EMAIL_PASSWORD = "..."              # Uni-Account Passwort
 UK_NUMMER = "uk123456"
 EWS_ENDPOINT = 'https://<mailserver>/EWS/Exchange.asmx'
 BOT_COMMAND_PREFIX = "!" 
-GOOGLE_FORM_LINK = "https://docs.google.com/forms/d/e/1FAIpQLSeXo2YhgmnH7VOIlu0sIIkDtsELVTVIlBhA_9olByY1UrhRwQ/viewform?" # Teilen-Link, bis viewform?
+GOOGLE_FORM_LINK = "https://docs.google.com/forms/d/e/.../viewform?" # Teilen-Link, bis viewform?
 ```
 ### Details about email filtering and processing
 
