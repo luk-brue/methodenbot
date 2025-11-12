@@ -10,6 +10,7 @@ Dabei werden zunächst die wichtigsten Informationen zusammengefasst in einer ku
 
 **Voraussetzungen**
 
+- Python3, pip
 - optimal: dauerhaft laufender Rechner, der das Skript kontinuierlich ausführt. Aber auch nach Ausfällen bei Neustarts werden die 100 neuesten Emails im INBOX-Ordner geholt.
 - Der Rechner muss nur Anfragen ins Internet senden können, selbst aber keine Anfragen entgegennehmen. Optimal für strenge Firewalls wie z.B. in der Uni. 
 - Es wird ein Matrix Account benötigt mit Passwort und Username
@@ -25,8 +26,8 @@ Dabei werden zunächst die wichtigsten Informationen zusammengefasst in einer ku
 - Klone dieses Repository.
 - Erstelle `.env` Datei darin. Enthält Konfigurationsvariablen, die als Umgebungsvariablen ausgelesen werden. Zum Aufbau der Datei siehe unten. Bitte Berechtigungen und Zugriff auf die Datei einschränken.
 - Erstelle ein virtuelles Environment für Python (`venv` oder `conda`)
-- Installiere Dependencies
-- `main.py` muss ausgeführt werden, um die Email-Matrix-Brücke laufen zu lassen. Es bietet sich an, auf Linux einen `systemd` Service einzurichten, der sich selbst neu startet bei Fehlern und beim Bootvorgang gestartet wird. 
+- Installiere Dependencies aus `requirements.txt`
+- `main.py` muss ausgeführt werden, um die Email-Matrix-Brücke laufen zu lassen. Es bietet sich an, auf Linux einen `systemd` Service einzurichten, der sich selbst neu startet bei Fehlern und nach dem Bootvorgang gestartet wird. 
 
 ### .env
 
