@@ -322,7 +322,12 @@ def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], 
         fragen=html.escape(fragen)
         fragen='<br>'.join(fragen.splitlines())
 
-        html_text = f'<b>Beschreibung:</b><br>{beschreibung}<br><b>Fragen:</b><br>{fragen}<br><b>R-Skript:</b><br><pre><code class="language-r">{html.escape(rskript)}</code></pre>'
+        if rskript is not None:
+            rskript = html.escape(rskript)
+        else:
+            rskript = html.escape("---")
+
+        html_text = f'<b>Beschreibung:</b><br>{beschreibung}<br><br><b>Fragen:</b><br>{fragen}<br><br><b>R-Skript:</b><br><pre><code class="language-r">{rskript}</code></pre>'
         logger.info(f"Beschreibugn: {beschreibung}")
         matrixbot.send_message(msg=croppedtext, thread_reply_to=event_id, html_msg=html_text)
 
