@@ -14,4 +14,5 @@ class Configuration:
         self.ews_endpoint = os.getenv("EWS_ENDPOINT")
         self.bot_command_prefix = os.getenv("BOT_COMMAND_PREFIX")
         self.matrix_room_id = os.getenv("MATRIX_ROOM_ID")
+        self.matrix_console_room_id = os.getenv("MATRIX_CONSOLE_ROOM_ID")
         self.google_form_link = os.getenv("GOOGLE_FORM_LINK")

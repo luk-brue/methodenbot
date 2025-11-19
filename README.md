@@ -36,7 +36,8 @@ Beispiel einer .env-Datei:
 MATRIX_SERVER="https://..." # Home-Server des Bots
 MATRIX_USER="uXXXX"         # Bot user
 MATRIX_PASSWORD="..."
-MATRIX_ROOM_ID = "!....:...." # ID des Raums, wohin der Bot Nachrichten senden soll.
+MATRIX_ROOM_ID = "!....:...." # ID des Raums, wohin der Bot eingehende Mail-Nachrichten senden soll.
+MATRIX_CONSOLE_ROOM_ID = "!...:..." # ID des Raums, wo der Bot auf Commands hört. 
 EMAIL_ADDRESS = "....@....de"  #  Exchange-E-Mail-Adresse
 EMAIL_PASSWORD = "..."              # Uni-Account Passwort
 UK_NUMMER = "uk123456"
