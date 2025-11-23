@@ -25,7 +25,7 @@ a = init_exchange_connection(config)
 #     y = False
 #   except:
 #     print("Bitte eine Jahreszahl eingeben. Probier es nochmal")
-jahr=2025
+jahr=2024
 start = datetime.datetime(jahr, 1, 1, tzinfo=a.default_timezone)
 end = datetime.datetime(jahr+1, 1, 1, tzinfo=a.default_timezone)
 # Filter by a date range
@@ -47,7 +47,7 @@ c = Counter(sent_date)
 for i in range(1, 13):
     print(f"{i}: {c[i]}")
 
-print(f"Hole Anzahl der {jahr} empfangenen Nachrichten")
+print(f"Hole Gesamt-Anzahl der {jahr} empfangenen Nachrichten")
 # print(a.root.tree())
 # received_messages = a..filter(datetime_received__range=(start, end)).order_by('-datetime_received')
 kor=a.root // "Oberste Ebene des Informationsspeichers" // "Korrespondenz"
