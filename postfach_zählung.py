@@ -7,12 +7,12 @@ Ermittele die Anzahl der eingegangenen Kontaktformulare
 import logging
 from exchangelib import Account, Message
 import datetime
+from collections import Counter
 # own stuff
 from exchangemail import init_exchange_connection, is_typo3_contact_form, check_typo3_x_mailer
 from configuration import Configuration as LocalConfig
 
 logger = logging.getLogger(__name__)
-
 
 config = LocalConfig()
 a = init_exchange_connection(config)
@@ -30,11 +30,23 @@ start = datetime.datetime(jahr, 1, 1, tzinfo=a.default_timezone)
 end = datetime.datetime(jahr+1, 1, 1, tzinfo=a.default_timezone)
 # Filter by a date range
 sent_messages = a.sent.filter(datetime_received__range=(start, end))
-print(f"Hole Anzahl der {jahr} gesendeten Nachrichten")
+print(f"Hole Gesamt-Anzahl der {jahr} gesendeten Nachrichten")
 # print(f"Betreff der in {jahr} gesendeten Nachrichten:")
 # for message in sent_messages:
 #     print(message.subject)
 print(f"Anzahl: {sent_messages.count()}")
+print(f"Hole Anzahl der gesendeten Nachrichten je Monat...")
+# get by month
+sent_date = list()
+sent_msg=list(sent_messages)
+for m in sent_msg:
+    dt = m.datetime_sent
+    sent_date.append(dt.month)
+
+c = Counter(sent_date)
+for i in range(1, 13):
+    print(f"{i}: {c[i]}")
+
 print(f"Hole Anzahl der {jahr} empfangenen Nachrichten")
 # print(a.root.tree())
 # received_messages = a..filter(datetime_received__range=(start, end)).order_by('-datetime_received')
