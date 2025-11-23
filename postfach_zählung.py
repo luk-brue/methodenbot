@@ -57,6 +57,7 @@ received_n = messages.count()
 print(f"Anzahl: {received_n}")
 print(f"Zähle davon die Kontaktformular-Anfragen... \n(zeitintensiv, da jede Mail abgerufen und geprüft wird)")
 # counter for contact forms
+form_date = list()
 x=0
 for m in messages:
     #print(m.subject)
@@ -65,5 +66,10 @@ for m in messages:
         if is_typo3_contact_form(m):
             #print("✅ Kontaktformular-Anfrage")
             x += 1
+            form_date.append(m.datetime_received.month)
             #print(x)
-print(f"{x} von {received_n} eingegangenen Mails in {jahr} waren initiale Kontaktformular-Anfragen.") 
+print(f"{x} von {received_n} eingegangenen Mails in {jahr} waren initiale Kontaktformular-Anfragen.")
+print("Aufgeschlüsselt nach Monat:")
+c = Counter(form_date)
+for i in range(1, 13):
+    print(f"{i}: {c[i]}") 
