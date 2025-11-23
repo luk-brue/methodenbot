@@ -14,6 +14,7 @@ class MatrixBot:
     """
     Tries to connect the bot to the Client-Server-API, using either a cached AccessToken or
     tries to obtain a token using password login. 
+    No methods for cryptography provided here. 
     """
     def __init__(self, envvars: Configuration):
         # use botlib Creds class for encrypted storage
