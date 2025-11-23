@@ -25,7 +25,7 @@ a = init_exchange_connection(config)
 #     y = False
 #   except:
 #     print("Bitte eine Jahreszahl eingeben. Probier es nochmal")
-jahr=2023
+jahr=2025
 start = datetime.datetime(jahr, 1, 1, tzinfo=a.default_timezone)
 end = datetime.datetime(jahr+1, 1, 1, tzinfo=a.default_timezone)
 # Filter by a date range
@@ -75,4 +75,9 @@ print(f"{x} von {received_n} eingegangenen Mails in {jahr} waren initiale Kontak
 print("Aufgeschlüsselt nach Monat:")
 c = Counter(form_date)
 for i in range(1, 13):
-    print(f"{i}: {c[i]}") 
+    print(f"{i}: {c[i]}")
+
+print(f"Alle in {jahr} empfangenen Nachrichten aufgeschlüsselt nach Monat:")
+c = Counter(all_date)
+for i in range(1, 13):
+    print(f"{i}: {c[i]}")
