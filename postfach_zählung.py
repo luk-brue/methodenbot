@@ -25,7 +25,7 @@ a = init_exchange_connection(config)
 #     y = False
 #   except:
 #     print("Bitte eine Jahreszahl eingeben. Probier es nochmal")
-jahr=2024
+jahr=2023
 start = datetime.datetime(jahr, 1, 1, tzinfo=a.default_timezone)
 end = datetime.datetime(jahr+1, 1, 1, tzinfo=a.default_timezone)
 # Filter by a date range
@@ -57,6 +57,7 @@ received_n = messages.count()
 print(f"Anzahl: {received_n}")
 print(f"Zähle davon die Kontaktformular-Anfragen... \n(zeitintensiv, da jede Mail abgerufen und geprüft wird)")
 # counter for contact forms
+all_date = list()
 form_date = list()
 x=0
 for m in messages:
@@ -68,6 +69,8 @@ for m in messages:
             x += 1
             form_date.append(m.datetime_received.month)
             #print(x)
+    all_date.append(m.datetime_received.month)
+
 print(f"{x} von {received_n} eingegangenen Mails in {jahr} waren initiale Kontaktformular-Anfragen.")
 print("Aufgeschlüsselt nach Monat:")
 c = Counter(form_date)
