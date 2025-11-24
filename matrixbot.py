@@ -19,21 +19,32 @@ class MatrixBot:
     def __init__(self, envvars: Configuration):
         # use botlib Creds class for encrypted storage
         self._session_stored_file = "matrix_token_cache.txt"
+        self._enable_token_cache = envvars.dev_enable_token_cache
         self.homeserver = envvars.matrix_server
         self.username = envvars.matrix_user
         self.password = envvars.matrix_password
         self.room_id = envvars.matrix_room_id
-        if not os.path.exists(self._session_stored_file):
-            self.password_login()
-            self.write_token_cache()
+        # dev option for token cache
+        if self._enable_token_cache:
+            if not os.path.exists(self._session_stored_file):
+                self.password_login()
+                self.write_token_cache()
+            else:
+                self.read_token_cache()
         else:
-            self.read_token_cache()
+            self.password_login()
         # Try to connect to API using cached token:
+        try:
+            self.access_token
+        except AttributeError:
+            logger.exception("Matrix Access Token could not be obtained for some reason.") 
+
         status = self.token_whoami()
         # In case the token was expired:
         if status == 401:
             self.password_login()
-            self.write_token_cache()
+            if self._enable_token_cache: 
+                self.write_token_cache()
        
     def password_login(self):
         try: 
@@ -65,7 +76,7 @@ class MatrixBot:
         except Exception:
             logger.exception("Error during parsing of request body after login of the matrix bot.")
             raise
-        logger.debug("Matrix Bot erfolgreich eingeloggt mit Passwort.")
+        logger.info("Matrix Bot erfolgreich eingeloggt mit Passwort.")
         
     def token_whoami(self):
         try:
@@ -79,14 +90,16 @@ class MatrixBot:
             return response.status_code
     
     def write_token_cache(self):
-        with open(self._session_stored_file, mode='w') as f:
-            f.write(self.access_token)
-        logger.debug("Matrix AccessToken in Cache Datei geschrieben.")
+        if self._enable_token_cache:
+            with open(self._session_stored_file, mode='w') as f:
+                f.write(self.access_token)
+            logger.info("Matrix AccessToken in Cache Datei geschrieben.")
     
     def read_token_cache(self):
-        with open(self._session_stored_file, mode='r') as f:
-            self.access_token=f.read()
-        logger.debug("Matrix AccessToken aus Cache Datei gelesen.")
+        if self._enable_token_cache:
+            with open(self._session_stored_file, mode='r') as f:
+                self.access_token=f.read()
+            logger.info("Matrix AccessToken aus Cache Datei gelesen.")
     
     def send_message(self, msg, room_id=None, thread_reply_to=None, html_msg=None):
         """
@@ -131,7 +144,8 @@ class MatrixBot:
             if response.status_code == 401:
                 # reauthenticate
                 self.password_login()
-                self.write_token_cache()
+                if self._enable_token_cache:
+                    self.write_token_cache()
                 response = requests.put(url, headers=headers, json=payload, timeout=15)
                 logger.debug(f"Response Text: {response.text}")
                 response.raise_for_status()

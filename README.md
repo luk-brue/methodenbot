@@ -44,6 +44,8 @@ UK_NUMMER = "uk123456"
 EWS_ENDPOINT = 'https://<mailserver>/EWS/Exchange.asmx'
 BOT_COMMAND_PREFIX = "!" 
 GOOGLE_FORM_LINK = "https://docs.google.com/forms/d/e/.../viewform?" # Teilen-Link, bis viewform?
+DEV_ENABLE_TOKEN_CACHE = 'false' # true / false. Bestimmt, ob das Token in einer unverschlüsselten Datei zwischengespeichert wird. 
+# Diese Option wird nur für Entwicklung benötigt, im laufenden Betrieb reicht es das Token im Arbeitsspeicher zu belassen und notfalls ein neues zu holen. 
 ```
 ### Details about email filtering and processing
 
