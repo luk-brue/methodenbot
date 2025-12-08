@@ -1,3 +1,4 @@
+import configparser
 import logging
 import os
 import json
@@ -20,6 +21,7 @@ class MatrixBot:
     No methods for cryptography provided here. 
     """
     def __init__(self, envvars: Configuration):
+        logger.info("Starting matrix bot.")
         self.device_id = None
         self.access_token = None
         self.homeserver = envvars.matrix_server

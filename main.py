@@ -16,7 +16,6 @@ logging.basicConfig(level=logging.INFO,
 
 def main():
     envvars = Configuration()
-    logger.info("Starting matrix bot.")
     bot = matrixbot.MatrixBot(envvars)
     # bot.send_message("Hallo! Das hier wurde von **Python** gesendet\n```r\nfunction() <- x\n```", 
     #     thread_reply_to="$VKK8yix7f9gXgC9Ki1ZeslGgG7bB5sBSbYp-uRvbakQ",
