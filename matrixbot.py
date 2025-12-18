@@ -44,8 +44,8 @@ class MatrixBot:
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e: 
-            logger.exception("Fehler beim Login des Matrix Bots mit Passwort:")
-            logger.info("Versuche erneute Anfrage zu senden in 10 Sekunden.")
+            logger.exception("Error at login with password:")
+            logger.info("Retry in 10 seconds...")
             time.sleep(10)
             response = requests.post(f"{self.homeserver}/_matrix/client/v3/login", 
                 json = {
@@ -55,7 +55,7 @@ class MatrixBot:
                 })
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
-            logger.exception("Nicht-HTTP-Fehler beim Request für Login des Matrix Bots mit Passwort:")
+            logger.exception(f"Non-HTTP-Fehler at Matrix login with password: {e}",)
 
         try:
             response_body = json.loads(response.text)
