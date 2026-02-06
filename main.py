@@ -20,7 +20,7 @@ def main():
     try:
         account = exchangemail.init_exchange_connection(envvars)
         processed_emails = exchangemail.load_processed_emails(envvars.processed_file)
-        logger.debug("Lade max. 100 Emails aus der INBOX")
+        logger.info("Lade Emails aus der INBOX (max. 100)...")
         messages = list(account.inbox.all().order_by('-datetime_received')[:100])
         logger.info(f"{len(messages)} Emails aus INBOX geholt.")
         exchangemail.clean_up_processed_file(envvars.processed_file, messages, processed_emails)

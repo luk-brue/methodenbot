@@ -253,11 +253,25 @@ def parse_email_data(item: Message) -> Dict[str, str]:
     except KeyError:
         rskript = None
     try:
-        datensatz = results['Bei R Fragen: Datensatz° ']
+        dataname = results['Bei R Fragen: Datensatz° ']
+        if "." in dataname: 
+            dataname_components = dataname.split(".")
+            if len(dataname_components) > 1:
+                datensatz = f"✉️ Datei mit Endung .{dataname_components[1]}"
+        else:
+            datensatz = f"✉️ {dataname}"
     except KeyError:
         datensatz = None
     try: 
-        präregistrierung = results['Präregistrierung ']
+        pname = results['Präregistrierung ']
+        if "." in pname:
+            pname_components = pname.split(".")
+            if len(pname_components) > 1:
+                präregistrierung  = f"✉️ Datei mit Endung .{pname_components[1]}"
+        else:
+            präregistrierung = f"✉️ {pname}"
+
+
     except KeyError:
         präregistrierung = None
 
@@ -322,7 +336,13 @@ def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], 
     # get the pre-filled protocol url
     try:
         anfrage=""
-        sender = email_data['sender_name'].split(", ")[1] # This is to only keep the first name
+        sender = email_data['sender_name']
+        # Name abbreviation for privacy reasons. Discard the last name. However, some people don't fill 
+        # the form appropriately - they put their whole name in the last name field. 
+        if ", " in sender: # sign that form was appropriately filled
+            sender = sender.split(", ")[1] # This is to only keep the first name
+        else: # if form was not appropriately filled, name will likely be in "first name whitespace last name" format
+            sender = sender.split()[0] # if there is no whitespace this returns the string itself
         sender_name=requests.utils.quote(sender)
         fachsemester = requests.utils.quote(email_data['fachsemester'])
         art = requests.utils.quote(email_data['art'])
@@ -332,7 +352,10 @@ def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], 
             betreuung = requests.utils.quote('Keine Angabe')
         studiengang = requests.utils.quote(email_data['studiengang'])
         fachgebiet = requests.utils.quote(email_data['fachgebiet'])
-        start_date_parsed = email_data['received_date'].replace("T", " ")[:16] # This is necessary to strip the seconds from the datetime string, to conform to google forms
+        try:
+            start_date_parsed = email_data['received_date'].replace("T", " ")[:16] # This is necessary to strip the seconds from the datetime string, to conform to google forms
+        except:
+            start_date_parsed = "Unbekannt"
         start_date = requests.utils.quote(start_date_parsed)
         message_id = requests.utils.quote(email_data['message_id'])
         url=f"{config.google_form_link}usp=pp_url&entry.1084327688={anfrage}&entry.1339219203={sender_name}&entry.1526227417={studiengang}&entry.760579146={betreuung}&entry.302223532={fachgebiet}&entry.1573426724={art}&entry.1469014536={fachsemester}&entry.701693485={message_id}&entry.1479923903={start_date}"
@@ -340,13 +363,12 @@ def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], 
         text_protocol_url=f"Protokoll-Link vorausgefüllt:\n\n{url}"
     except Exception as e:
         logger.warning(f"Protokoll-Url konnte nicht erstellt werden - Grund: {e}")
+        logger.warning(traceback.format_exc())
         html_protocol_url=f'{html.escape("Protokoll-Link vorausgefüllt: Konnte nicht erstellt werden - Verwende ")}<a href="{config.google_form_link}">normalen Protokoll-Link</a>'
         text_protocol_url=f"Konnte nicht erstellt werden, verwende normalen Protokoll-Link: {config.google_form_link}"
 
     try:
         logger.info(f"Poste Details in Thread unter Nachricht mit ID {event_id}")
-        if not start_date_parsed:
-            start_date_parsed = "Unbekannt"
         # prepare the raw text for clients who don't support html rendering
         detailtext=f"Beschreibung:\n{beschreibung}\n\nFragen:\n{fragen}\n\nR-Skript:\n```r\n{rskript}\n```\n\nDatensatz:\n{datensatz}\n\nPräregistrierung:\n{prägregistrierung}\n\nProtokoll-Link vorausgefüllt:\n{text_protocol_url}\n\nEingangsdatum:\n{start_date_parsed}"
         msg_len = len(detailtext)
@@ -365,7 +387,11 @@ def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], 
         fragen='<br>'.join(fragen.splitlines())
 
         if rskript is not None:
-            rskript = f'<b>R-Skript:</b><br><pre><code class="language-r">{html.escape(rskript)}</code></pre>'
+            if len(rskript) < 19500:
+                script_escaped = html.escape(rskript)
+            else:
+                script_escaped = html.escape(rskript)[:19500] + f"<br><br><b>[...] {len(rskript) - 19500} weitere Zeichen</b>"
+            rskript = f'<b>R-Skript:</b><br><pre><code class="language-r">{script_escaped}</code></pre>'
         else:
             rskript = f'<b>R-Skript: </b><br>{html.escape("Nicht angegeben")}'
         
@@ -390,7 +416,7 @@ def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], 
             # send normally
             matrixbot.send_message(msg=croppedtext, thread_reply_to=event_id, html_msg=html_text)
         else:
-            matrixbot.send_message(msg="Die Anfrage war zu lang, um sie über Matrix zu senden. Bitte im Postfach nachschauen.", thread_reply_to=event_id)
+            matrixbot.send_message(msg="Die Details der Anfrage waren zu lang, um sie über Matrix zu senden. Bitte im Postfach nachschauen.", thread_reply_to=event_id)
 
 
     except Exception as e:
