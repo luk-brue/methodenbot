@@ -149,12 +149,23 @@ class AISettings:
             raise SummaryUnavailable('ambiguous_key_configuration')
         key = self.api_key
         if self.api_key_file:
+            key_path = Path(self.api_key_file).expanduser()
+            credentials_directory = os.getenv('CREDENTIALS_DIRECTORY', '')
+            credentials_root = Path(credentials_directory) if credentials_directory else None
+            is_systemd_credential = bool(
+                credentials_root and credentials_root.is_absolute()
+                and key_path.parent == credentials_root)
             try:
-                fd = os.open(Path(self.api_key_file).expanduser(), os.O_RDONLY | os.O_NOFOLLOW)
+                fd = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW)
                 with os.fdopen(fd, 'r') as handle:
                     metadata = os.fstat(handle.fileno())
-                    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077
-                            or metadata.st_uid not in (0, os.geteuid())):
+                    secure_mode = (stat.S_IMODE(metadata.st_mode) == 0o400
+                                   if is_systemd_credential
+                                   else not metadata.st_mode & 0o077)
+                    secure_owner = (is_systemd_credential
+                                    or metadata.st_uid in (0, os.geteuid()))
+                    if (not stat.S_ISREG(metadata.st_mode)
+                            or not secure_mode or not secure_owner):
                         raise SummaryUnavailable('key_file_permissions')
                     key = handle.read(8193)
             except (OSError, UnicodeError):

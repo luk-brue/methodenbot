@@ -202,6 +202,28 @@ class SettingsTests(NoNetworkTest):
             with self.assertRaisesRegex(SummaryUnavailable, 'key_file_permissions'):
                 settings.read_key()
 
+    def test_systemd_credential_accepts_secure_idmapped_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'gwdg-local-token'
+            path.write_text('UNIT-TEST-KEY\n')
+            path.chmod(0o400)
+            settings = AISettings(enabled=True, transfer_approved=True, api_key_file=str(path))
+            metadata = path.stat()
+            idmapped = SimpleNamespace(st_mode=metadata.st_mode, st_uid=65534)
+            with (patch.dict(os.environ, {'CREDENTIALS_DIRECTORY': directory}),
+                  patch('ai_summary.os.fstat', return_value=idmapped)):
+                self.assertEqual(settings.read_key(), 'UNIT-TEST-KEY')
+
+    def test_systemd_credential_still_requires_mode_0400(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'gwdg-local-token'
+            path.write_text('UNIT-TEST-KEY\n')
+            path.chmod(0o600)
+            settings = AISettings(enabled=True, transfer_approved=True, api_key_file=str(path))
+            with patch.dict(os.environ, {'CREDENTIALS_DIRECTORY': directory}):
+                with self.assertRaisesRegex(SummaryUnavailable, 'key_file_permissions'):
+                    settings.read_key()
+
     def test_symlink_key_and_ambiguous_key_configuration_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'key'
