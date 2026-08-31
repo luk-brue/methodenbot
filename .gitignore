@@ -211,3 +211,12 @@ __marimo__/
 *.csv
 store
 *cache.txt
+
+# Methodenbot runtime credentials and state
+.env.*
+!.env.example
+tokens.json
+token_cache.json
+.secrets/
+*.key
+*.sqlite*

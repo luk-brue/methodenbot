@@ -1,0 +1,14 @@
+{
+  "request": {
+    "beschreibung": "Ich habe Daten für meine Abschlussarbeit und brauche Unterstützung bei der Auswertung.",
+    "fragen": "Wie gehe ich als Nächstes vor?"
+  },
+  "fixture_response": {
+    "kurzfassung": "Allgemeiner Unterstützungsbedarf bei der Auswertung; konkrete Angaben zu Analyseart, Software und Modell fehlen.",
+    "analyseart": {"wert": "", "status": "nicht_angegeben", "beleg": ""},
+    "analyseschritt": {"wert": "Klärung der Auswertungsstrategie", "status": "abgeleitet", "beleg": "Unterstützung bei der Auswertung"},
+    "software": {"wert": "", "status": "nicht_angegeben", "beleg": ""},
+    "statistisches_modell": {"wert": "", "status": "nicht_angegeben", "beleg": ""},
+    "offene_punkte": ["Analyseart, Software und statistisches Modell nicht angegeben"]
+  }
+}

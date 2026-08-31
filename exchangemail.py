@@ -2,26 +2,42 @@ import logging
 import os
 import csv
 import quopri
-import re
 import html
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
-from pprint import pprint, pformat
 import json
-import traceback
-import pandas as pd
+import hashlib
+import io
+from pathlib import Path
+import stat
+import uuid
 from exchangelib import Configuration, Credentials, Account, DELEGATE, Message
 from exchangelib.services import SubscribeToStreaming
 from exchangelib.properties import NewMailEvent
-from typing import Set, Dict, Optional, List
+from typing import Set, Dict, Optional
 # own stuff:
 from configuration import Configuration as LocalConfig
-from stats_table_manager import glimpse, StatsTableManager
-from matrixbot import MatrixBot
+from stats_table_manager import StatsTableManager
+from matrixbot import MAX_EVENT_CONTENT_BYTES, MatrixBot, matrix_message_content
+from types import SimpleNamespace
+from form_table_compat import parse_compatible
+from ai_summary import post_ai_thread_reply
 
 logger = logging.getLogger(__name__)
+# The inherited INFO messages contain mailbox identifiers and form contents.
+logger.setLevel(logging.WARNING)
+
+MAX_PROCESSED_FILE_BYTES = 5_000_000
+
+
+class ProcessedEmailStateError(RuntimeError):
+    pass
+
+
+class DeliveryNotConfirmed(RuntimeError):
+    pass
 
 def init_exchange_connection(config: LocalConfig) -> Account:
     """Initialisiert die Verbindung zu Exchange. Sollten hier mit der Konfigurations jemals
@@ -41,41 +57,96 @@ def init_exchange_connection(config: LocalConfig) -> Account:
         logger.info("Exchange-Verbindung erfolgreich hergestellt")
         return account
     except Exception as e:
-        logger.error(f"Fehler beim Verbinden mit Exchange: {e}")
+        logger.error("Fehler beim Verbinden mit Exchange: %s", type(e).__name__)
         raise
 
 def load_processed_emails(filename: str) -> Set[str]:
-    """Lädt bereits verarbeitete E-Mail-IDs aus der CSV-Datei."""
-    processed = set()
-    if os.path.exists(filename):
+    """Load the delivery ledger strictly; corruption must never mean "nothing sent"."""
+    path = Path(filename)
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return set()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as raw:
+            metadata = os.fstat(raw.fileno())
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                    or metadata.st_size > MAX_PROCESSED_FILE_BYTES):
+                raise ProcessedEmailStateError('unsafe_processed_email_file')
+            payload = raw.read(MAX_PROCESSED_FILE_BYTES + 1)
+        if len(payload) > MAX_PROCESSED_FILE_BYTES:
+            raise ProcessedEmailStateError('processed_email_file_too_large')
+        text = payload.decode('utf-8')
+        reader = csv.DictReader(io.StringIO(text, newline=''))
+        if reader.fieldnames != ['message_id']:
+            raise ProcessedEmailStateError('processed_email_header_invalid')
+        processed = set()
+        for row in reader:
+            if set(row) != {'message_id'}:
+                raise ProcessedEmailStateError('processed_email_row_invalid')
+            message_id = row.get('message_id')
+            if (not isinstance(message_id, str) or not message_id or len(message_id) > 2000
+                    or '\n' in message_id or '\r' in message_id):
+                raise ProcessedEmailStateError('processed_email_id_invalid')
+            processed.add(message_id)
+        return processed
+    except ProcessedEmailStateError:
+        raise
+    except (OSError, UnicodeError, csv.Error):
+        raise ProcessedEmailStateError('processed_email_file_unreadable') from None
+
+
+def _write_processed_emails(filename: str, message_ids: Set[str]):
+    path = Path(filename)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        metadata = os.lstat(path.parent)
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077):
+            raise ProcessedEmailStateError('unsafe_processed_email_directory')
+    except OSError:
+        raise ProcessedEmailStateError('processed_email_directory_unreadable') from None
+    for message_id in message_ids:
+        if (not isinstance(message_id, str) or not message_id or len(message_id) > 2000
+                or '\n' in message_id or '\r' in message_id):
+            raise ProcessedEmailStateError('processed_email_id_invalid')
+    temporary = path.parent / ('.' + path.name + '.new.' + uuid.uuid4().hex)
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=['message_id'])
+            writer.writeheader()
+            writer.writerows({'message_id': value} for value in sorted(message_ids))
+            handle.flush()
+            os.fsync(handle.fileno())
         try:
-            with open(filename, 'r', encoding='utf-8') as file:
-                reader = csv.DictReader(file)
-                for row in reader:
-                    processed.add(row['message_id'])
-                logger.info(f"{len(processed)} Einträge in processed_emails.csv enthalten")
-        except Exception as e:
-            logger.error(f"Fehler beim Laden der processed_emails.csv: {e}")
-    return processed
+            existing = os.lstat(path)
+            if (not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.geteuid()
+                    or stat.S_IMODE(existing.st_mode) != 0o600):
+                raise ProcessedEmailStateError('unsafe_processed_email_file')
+        except FileNotFoundError:
+            pass
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 def save_processed_email(filename: str, message_id):
-    file_exists = os.path.exists(filename)
-    try:
-        with open(filename, 'a', newline='', encoding='utf-8') as file:
-            writer = csv.DictWriter(file, fieldnames=['message_id'])
-            # Create file + header if it does not exist
-            if not file_exists:
-                writer.writeheader()
-                logger.info("Erstelle CSV-Datei.")
-            # Check if the file is empty and create header if necessary
-            if file.tell() == 0:
-                writer.writeheader()
-                logger.info("Leere CSV-Datei - erstelle Header")
-            writer.writerow({'message_id': message_id})
-
-        logger.info("Eintrag in processed_emails.csv gesetzt.")
-    except Exception as e:
-        logger.error(f"Fehler beim Speichern in processed_emails.csv: {e}")
+    processed = load_processed_emails(filename)
+    if message_id in processed:
+        return False
+    processed.add(message_id)
+    _write_processed_emails(filename, processed)
+    return True
 
 def clean_up_processed_file(filename: str, messages: list, processed_emails: Set[str]):
     """Routine to prevent the csv file to grow larger and larger: Restrict the possible IDs that the file may
@@ -86,31 +157,19 @@ def clean_up_processed_file(filename: str, messages: list, processed_emails: Set
     """
     logger.info("Finde obsolete Message-IDs in csv-Datei...")
     message_ids = set()
-    file_exists = os.path.exists(filename)
     for message in messages:
-        try:
-            message_ids.add(message.message_id)
-        except Exception as e:
-            logger.error(e)
-    #logger.info(pformat(message_ids))
-    obsolete_ids = processed_emails - message_ids # calculate set difference
-    processed_emails.difference_update(obsolete_ids) # update the set to contain in-obsolete ids
-    try:
-        with open(filename, 'w', encoding='utf-8') as file:
-            writer = csv.DictWriter(file, fieldnames=['message_id'])
-            if not file_exists:
-                logger.info("CSV-Datei erstellt.")
-                writer.writeheader()
-            # Check if the file is empty and create header if necessary
-            if file.tell() == 0:
-                writer.writeheader()
-                logger.info("Leere CSV-Datei - erstelle Header")
-            writer.writerows([{'message_id': mid} for mid in processed_emails])
-        logger.info(f"{len(obsolete_ids)} obsolete Message-IDs entfernt aus CSV-Datei.")
-        return processed_emails
-    except Exception as e:
-        logger.error(f"Fehler beim Speichern in CSV-Datei: {e}")
-        return None
+        message_id = getattr(message, 'message_id', None)
+        if not isinstance(message_id, str) or not message_id:
+            # Internet Message-ID is optional in Exchange. Such a message cannot
+            # match a ledger entry and must not block the entire startup cleanup.
+            logger.warning('Inbox-Nachricht ohne stabile Message-ID beim Cleanup übersprungen.')
+            continue
+        message_ids.add(message_id)
+    retained = processed_emails & message_ids
+    _write_processed_emails(filename, retained)
+    processed_emails.clear()
+    processed_emails.update(retained)
+    return processed_emails
 
 def check_typo3_x_mailer(message: Message) -> Optional[str]:
     """Prüft, ob ein TYPO3 X-Mailer Header vorhanden ist und gibt den Wert zurück."""
@@ -139,7 +198,7 @@ def is_typo3_contact_form(message: Message) -> bool:
     subject = message.subject or ""
     reply_prefixes = ['AW:', 'RE:', 'Aw:', 'Re:', 'aw:', 're:']
     if any(subject.strip().startswith(prefix) for prefix in reply_prefixes):
-        logger.info(f"Subject hat Antwort-Präfix: '{subject}'")
+        logger.info("Subject hat ein Antwort-Präfix")
         return False
 
     # Prüfung auf References oder In-Reply-To Header (deutet auf Antwort hin)
@@ -189,8 +248,10 @@ def is_typo3_contact_form(message: Message) -> bool:
     logger.info("Finale Entscheidung: Nicht als TYPO3-Kontaktformular erkannt")
     return False
 
-def parse_email_data(item: Message) -> Dict[str, str]:
+def _parse_email_data_legacy(item: Message) -> Dict[str, str]:
     """Parst die relevanten Daten aus der TYPO3 E-Mail und extrahiert die HTML-Tabelle mit BeautifulSoup."""
+    logger = logging.getLogger(__name__ + '.legacy_parser')
+    logger.disabled = True
     logger.info("🔍 Starte E-Mail-Parsing (HTML-Tabelle mit BeautifulSoup)...")
 
     # E-Mail-Datum extrahieren
@@ -236,7 +297,7 @@ def parse_email_data(item: Message) -> Dict[str, str]:
                     results[feld] = inhalt
             else:
                 logger.info("Keine HTML-Tabelle gefunden")
-                logger.info(f"Gesamter Body-Inhalt: {body}")  # Protokolliere den gesamten Body
+                logger.info("Keine passende HTML-Tabelle gefunden; Inhalt wird nicht protokolliert")
                 results = None
         except Exception as e:
             logger.error(f"Fehler beim Verarbeiten des Body: {e}")
@@ -303,7 +364,13 @@ def parse_email_data(item: Message) -> Dict[str, str]:
     #logger.info(f"Parsed data content:{pformat(parsed_data)}")
     return parsed_data
 
-def matrix_post_message(matrixbot: MatrixBot, email_data: Dict[str, str]) -> Optional[str]:
+def parse_email_data(item: Message) -> Dict[str, str]:
+    """Validated TH/TD compatibility; original formatting remains unchanged."""
+    api = SimpleNamespace(BeautifulSoup=BeautifulSoup, parse_email_data=_parse_email_data_legacy)
+    data, _ = parse_compatible(api, item)
+    return data
+
+def matrix_post_message(matrixbot: MatrixBot, email_data: Dict[str, str], transaction_id=None) -> Optional[str]:
     """Postet eine Message in Rocket Chat"""
     logger.info("Erstelle Matrix-Nachricht...")
     # extrahiere Felder aus Dict
@@ -314,35 +381,49 @@ def matrix_post_message(matrixbot: MatrixBot, email_data: Dict[str, str]) -> Opt
     studiengang = f"{email_data['studiengang']}"
     fachgebiet = f"{email_data['fachgebiet']}"
     #description = f"{pprint(email_data)}"
-    start_date = f"{email_data['received_date']}"
     # poste Nachricht
     try:
-        event_id = matrixbot.send_message(
-            msg = f"{sender}\n{art} bei {betreuung} ({fachgebiet})\n{studiengang}, {fachsemester}. FS.",
-            html_msg=f"<b>{sender}</b><br>{art} bei {betreuung} ({fachgebiet})<br>{studiengang}, {fachsemester}. FS."
-            )
+        payload = dict(
+            msg=f"{sender}\n{art} bei {betreuung} ({fachgebiet})\n{studiengang}, {fachsemester}. FS.",
+            html_msg=(f"<b>{html.escape(sender)}</b><br>{html.escape(art)} bei "
+                      f"{html.escape(betreuung)} ({html.escape(fachgebiet)})<br>"
+                      f"{html.escape(studiengang)}, {html.escape(fachsemester)}. FS."))
+        if matrix_message_content(payload['msg'], payload['html_msg'])[1] > MAX_EVENT_CONTENT_BYTES:
+            payload = {
+                'msg': ('Neue Methodenberatungsanfrage. Die Kurzübersicht war für Matrix zu lang; '
+                        'bitte Originalangaben im Postfach prüfen.'),
+                'html_msg': ('<p><strong>Neue Methodenberatungsanfrage.</strong> Die Kurzübersicht '
+                             'war für Matrix zu lang; bitte Originalangaben im Postfach prüfen.</p>'),
+            }
+        if transaction_id is not None:
+            payload['transaction_id'] = transaction_id
+        event_id = matrixbot.send_message(**payload)
         return event_id
     except Exception:
         logger.exception(f"❌ Unerwarteter Fehler bei der Matrix API-Anfrage:")
         return None
 
-def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], event_id: str, config: LocalConfig) -> Optional[str]:
+def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], event_id: str,
+                              config: LocalConfig, transaction_id=None) -> Optional[str]:
     beschreibung = email_data['beschreibung']
     fragen = email_data['fragen']
     rskript = email_data['rskript']
     datensatz = email_data['datensatz']
     prägregistrierung = email_data['präregistrierung']
+    received = email_data.get('received_date')
+    start_date_parsed = (str(received).replace("T", " ")[:16]
+                         if received not in (None, '') else "Unbekannt")
     
     # get the pre-filled protocol url
     try:
         anfrage=""
-        sender = email_data['sender_name']
+        sender = str(email_data.get('sender_name') or 'Unbekannt')
         # Name abbreviation for privacy reasons. Discard the last name. However, some people don't fill 
         # the form appropriately - they put their whole name in the last name field. 
         if ", " in sender: # sign that form was appropriately filled
-            sender = sender.split(", ")[1] # This is to only keep the first name
+            sender = sender.split(", ", 1)[1] or 'Unbekannt' # This is to only keep the first name
         else: # if form was not appropriately filled, name will likely be in "first name whitespace last name" format
-            sender = sender.split()[0] # if there is no whitespace this returns the string itself
+            sender = sender.split()[0] if sender.split() else 'Unbekannt'
         sender_name=requests.utils.quote(sender)
         fachsemester = requests.utils.quote(email_data['fachsemester'])
         art = requests.utils.quote(email_data['art'])
@@ -352,23 +433,18 @@ def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], 
             betreuung = requests.utils.quote('Keine Angabe')
         studiengang = requests.utils.quote(email_data['studiengang'])
         fachgebiet = requests.utils.quote(email_data['fachgebiet'])
-        try:
-            start_date_parsed = email_data['received_date'].replace("T", " ")[:16] # This is necessary to strip the seconds from the datetime string, to conform to google forms
-        except:
-            start_date_parsed = "Unbekannt"
         start_date = requests.utils.quote(start_date_parsed)
         message_id = requests.utils.quote(email_data['message_id'])
         url=f"{config.google_form_link}usp=pp_url&entry.1084327688={anfrage}&entry.1339219203={sender_name}&entry.1526227417={studiengang}&entry.760579146={betreuung}&entry.302223532={fachgebiet}&entry.1573426724={art}&entry.1469014536={fachsemester}&entry.701693485={message_id}&entry.1479923903={start_date}"
         html_protocol_url=f'<a href="{url}">{html.escape("Protokoll-Link vorausgefüllt (Google Forms)")}</a>'
         text_protocol_url=f"Protokoll-Link vorausgefüllt:\n\n{url}"
     except Exception as e:
-        logger.warning(f"Protokoll-Url konnte nicht erstellt werden - Grund: {e}")
-        logger.warning(traceback.format_exc())
+        logger.warning("Protokoll-URL konnte nicht erstellt werden: %s", type(e).__name__)
         html_protocol_url=f'{html.escape("Protokoll-Link vorausgefüllt: Konnte nicht erstellt werden - Verwende ")}<a href="{config.google_form_link}">normalen Protokoll-Link</a>'
         text_protocol_url=f"Konnte nicht erstellt werden, verwende normalen Protokoll-Link: {config.google_form_link}"
 
     try:
-        logger.info(f"Poste Details in Thread unter Nachricht mit ID {event_id}")
+        logger.info("Poste Details in bestaetigten Thread")
         # prepare the raw text for clients who don't support html rendering
         detailtext=f"Beschreibung:\n{beschreibung}\n\nFragen:\n{fragen}\n\nR-Skript:\n```r\n{rskript}\n```\n\nDatensatz:\n{datensatz}\n\nPräregistrierung:\n{prägregistrierung}\n\nProtokoll-Link vorausgefüllt:\n{text_protocol_url}\n\nEingangsdatum:\n{start_date_parsed}"
         msg_len = len(detailtext)
@@ -411,29 +487,28 @@ def matrix_post_detail_thread(matrixbot: MatrixBot, email_data: Dict[str, str], 
         
 
         # send the message
-        combined_byte_length = len(html_text.encode('utf-8')) + len(croppedtext.encode('utf-8'))
-        if combined_byte_length < 62000: #max byte lengt of event = 65536
+        send_options = {'thread_reply_to': event_id}
+        if transaction_id is not None:
+            send_options['transaction_id'] = transaction_id
+        if matrix_message_content(croppedtext, html_text, event_id)[1] <= MAX_EVENT_CONTENT_BYTES:
             # send normally
-            matrixbot.send_message(msg=croppedtext, thread_reply_to=event_id, html_msg=html_text)
+            return matrixbot.send_message(msg=croppedtext, html_msg=html_text, **send_options)
         else:
-            matrixbot.send_message(msg="Die Details der Anfrage waren zu lang, um sie über Matrix zu senden. Bitte im Postfach nachschauen.", thread_reply_to=event_id)
+            return matrixbot.send_message(
+                msg="Die Details der Anfrage waren zu lang, um sie über Matrix zu senden. Bitte im Postfach nachschauen.",
+                **send_options)
 
 
     except Exception as e:
-        logger.error(f"❌ Unerwarteter Fehler beim Erstellen des Matrix Threads: {e}")
-        logger.error(traceback.format_exc())
+        logger.error("Unerwarteter Fehler beim Erstellen des Matrix-Threads: %s", type(e).__name__)
         return None
 
 def process_email(config: LocalConfig, account: Account, message: Message, processed_emails: Set[str], matrixbot: MatrixBot, stats: StatsTableManager) -> bool:
     """Verarbeitet eine einzelne E-Mail."""
-    try:
-        message_id = message.message_id
-        subject = message.subject or "Kein Subject"
-        logger.info(f"\n=== Verarbeite E-Mail ===")
-        logger.info(f"Message ID: {message_id}")
-        logger.info(f"Subject: {subject}")
-    except Exception as e:
-        logger.error(f"Fehler beim Extrahieren der Message ID oder Subject Fields: {e}")
+    message_id = getattr(message, 'message_id', None)
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 2000:
+        raise ValueError('E-Mail ohne stabile Message-ID')
+    logger.info("Verarbeite E-Mail")
 
     if message_id in processed_emails:
         logger.info(f"⏭️ Überspringe - bereits zu Matrix gesendet")
@@ -445,28 +520,47 @@ def process_email(config: LocalConfig, account: Account, message: Message, proce
         logger.info(f"Nicht als TYPO3-Kontaktformular erkannt")
         return False
 
-    logger.info(f"🎯 TYPO3-Kontaktformular gefunden: {subject}")
+    logger.info("TYPO3-Kontaktformular gefunden")
 
     email_data = parse_email_data(message)
     # try except weil Matrix Session Tokens ablaufen
     # unbekannt wie lange in unserer Installation gültig.
 
-    event_id = matrix_post_message(matrixbot=matrixbot, email_data=email_data)
+    stable = hashlib.sha256(message_id.encode('utf-8')).hexdigest()[:32]
+    event_id = matrix_post_message(matrixbot=matrixbot, email_data=email_data,
+                                   transaction_id='mail-' + stable + '-root')
 
-    if event_id is None:
-        logger.error("Fehler - Thread-ID ist None")
-        raise
+    if not isinstance(event_id, str) or not event_id.startswith('$') or len(event_id) < 2:
+        raise DeliveryNotConfirmed("Originalnachricht nicht bestätigt; kein Thread-Versand")
 
-    matrix_post_detail_thread(matrixbot = matrixbot, email_data = email_data, event_id = event_id, config=config)
-    save_processed_email(filename=config.processed_file, message_id=message_id)
+    # AI overview and original details are sibling replies under the same root.
+    # AI/network/send failures are absorbed; original details still follow.
+    state = getattr(config, 'control_state', None)
+    ai_enabled = (state.snapshot()['ai_enabled'] if state is not None
+                  else bool(getattr(getattr(config, 'ai', None), 'enabled', False)))
+    ai_service = getattr(config, 'ai_service', None)
+    if ai_service is not None:
+        ai_status = ai_service.post_thread_reply(
+            matrixbot, email_data, event_id, enabled=ai_enabled,
+            transaction_id='mail-' + stable + '-ai')
+    elif ai_enabled:
+        ai_status = post_ai_thread_reply(matrixbot, email_data, config, thread_root=event_id)
+    else:
+        ai_status = 'disabled'
+    if ai_enabled and ai_status not in ('summary_ready', 'unavailable'):
+        raise DeliveryNotConfirmed('KI-Nachricht nicht bestätigt; Anfrage bleibt unverarbeitet')
+
+    detail_id = matrix_post_detail_thread(matrixbot=matrixbot, email_data=email_data, event_id=event_id,
+                                          config=config, transaction_id='mail-' + stable + '-details')
+    if not isinstance(detail_id, str) or not detail_id.startswith('$'):
+        raise DeliveryNotConfirmed("Detailnachricht nicht bestätigt; Anfrage bleibt unverarbeitet")
     # collect keys and data to be saved in stats.csv
-    try:
-        allowed_keys = set(stats.HEADERS)
-        mail_record = {k: v for k, v in email_data.items() if k in allowed_keys}
-        mail_record.update({'tmid': event_id}) # add the thread message id
-    except Exception as e:
-        logger.error("Fehler beim Sammeln der Email-Daten für die Statistik", e)
+    allowed_keys = set(stats.HEADERS)
+    mail_record = {k: v for k, v in email_data.items() if k in allowed_keys}
+    mail_record.update({'tmid': event_id}) # add the thread message id
     stats.append_record(mail_record) # save data to stats.csv
+    save_processed_email(filename=config.processed_file, message_id=message_id)
+    processed_emails.add(message_id)
     return True
 
 def process_many_emails(messages: list, config: LocalConfig, account: Account, processed_emails: Set[str],
@@ -474,18 +568,24 @@ def process_many_emails(messages: list, config: LocalConfig, account: Account, p
     """Verarbeitet viele E-Mails."""
     try:
         logger.info(f"Verarbeite {len(messages)} E-Mails...")
+        delivery_error = None
         for message in messages:
             try:
                 process_email(config, account, message, processed_emails, matrixbot, stats)
+            except (ProcessedEmailStateError, OSError):
+                raise
+            except DeliveryNotConfirmed as exc:
+                # Continue the bounded startup batch so one bad request cannot
+                # starve newer ones, then make systemd restart and retry it.
+                logger.error("Matrix-Zustellung einer E-Mail nicht bestätigt.")
+                delivery_error = delivery_error or exc
             except Exception as e:
-                logger.error(f"Fehler beim Verarbeiten der E-Mail {message.sender.name}: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+                logger.error("Fehler beim Verarbeiten einer E-Mail: %s", type(e).__name__)
+        if delivery_error is not None:
+            raise delivery_error
         logger.info(f"Verarbeitung der Mails abgeschlossen.")
     except Exception as e:
-        logger.error(f"Fehler beim Verarbeiten der E-Mails: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error("Fehler beim Verarbeiten der E-Mails: %s", type(e).__name__)
         raise
 
 def maintain_notification_streaming(account: Account,
