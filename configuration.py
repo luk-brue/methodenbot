@@ -1,4 +1,5 @@
 from dotenv import load_dotenv
+import json
 import os
 import logging
 from pathlib import Path
@@ -6,6 +7,34 @@ import re
 from ai_summary import AISettings
 
 logger = logging.getLogger(__name__)
+
+MAX_ADDITIONAL_CONTROL_ROOMS = 8
+MATRIX_USER_ID = re.compile(r'@[^\s:]+:[^\s]+')
+MATRIX_ROOM_ID = re.compile(r'![^\s:]+:[^\s]+')
+
+
+def _strict_json_object(raw):
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate_json_key')
+            result[key] = value
+        return result
+
+    if not isinstance(raw, str) or len(raw.encode('utf-8')) > 16_384:
+        raise RuntimeError('MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON ist ungültig')
+    try:
+        value = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+    except (TypeError, ValueError, RecursionError):
+        raise RuntimeError('MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON ist ungültig') from None
+    if (not isinstance(value, dict) or len(value) > MAX_ADDITIONAL_CONTROL_ROOMS
+            or any(not isinstance(user, str) or not MATRIX_USER_ID.fullmatch(user)
+                   or not isinstance(room, str) or not MATRIX_ROOM_ID.fullmatch(room)
+                   for user, room in value.items())
+            or len(set(value.values())) != len(value)):
+        raise RuntimeError('MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON ist ungültig')
+    return value
 
 def _enabled(name, default=False):
     value = os.getenv(name)
@@ -37,6 +66,8 @@ class Configuration:
         self.matrix_room_id = os.getenv("MATRIX_ROOM_ID")
         self.matrix_console_room_id = os.getenv("MATRIX_CONSOLE_ROOM_ID")
         self.matrix_control_user = os.getenv("MATRIX_CONTROL_USER")
+        self.matrix_additional_control_rooms = _strict_json_object(
+            os.getenv("MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON", "{}"))
         self.matrix_device_id = os.getenv("MATRIX_DEVICE_ID", "METHODENBOT_FINAL_2026_08")
         self.matrix_token_file = os.getenv("MATRIX_TOKEN_FILE", str(self.state_dir / 'matrix-session.json'))
         self.allow_unencrypted_control_dm = _enabled("MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM")
@@ -63,11 +94,26 @@ class Configuration:
         missing = [name for name, value in required.items() if not isinstance(value, str) or not value.strip()]
         if missing:
             raise RuntimeError('Fehlende Konfiguration: ' + ', '.join(missing))
-        if not re.fullmatch(r'@[^\s:]+:[^\s]+', self.matrix_control_user):
+        if not MATRIX_USER_ID.fullmatch(self.matrix_control_user):
             raise RuntimeError('MATRIX_CONTROL_USER ist keine gültige Matrix-Benutzer-ID')
+        if (not MATRIX_ROOM_ID.fullmatch(self.matrix_console_room_id)
+                or not MATRIX_ROOM_ID.fullmatch(self.matrix_room_id)):
+            raise RuntimeError('Matrix-Raum-ID ist ungültig')
         if self.matrix_console_room_id == self.matrix_room_id:
             raise RuntimeError('Kontrollraum und produktiver Zielraum müssen verschieden sein')
+        additional = getattr(self, 'matrix_additional_control_rooms', {})
+        if (not isinstance(additional, dict)
+                or self.matrix_control_user in additional
+                or self.matrix_console_room_id in additional.values()
+                or self.matrix_room_id in additional.values()):
+            raise RuntimeError('Zusätzliche Matrix-Kontrollzuordnung kollidiert mit einem Haupteintrag')
         if not self.allow_unencrypted_control_dm:
             raise RuntimeError('Unverschlüsselte Kontroll-PN ist nicht ausdrücklich freigegeben')
         if not self.matrix_server.startswith('https://'):
             raise RuntimeError('MATRIX_SERVER muss HTTPS verwenden')
+
+    def control_bindings(self):
+        """Return the primary binding first and all additional bindings deterministically."""
+        additional = getattr(self, 'matrix_additional_control_rooms', {})
+        return ((self.matrix_control_user, self.matrix_console_room_id),
+                *tuple(sorted(additional.items())))

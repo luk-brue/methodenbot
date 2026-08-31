@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -37,6 +38,46 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn('MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM=true', result)
         self.assertIn('METHODENBOT_AI_DEFAULT_ENABLED=false', result)
         self.assertIn('MATRIX_CONTROL_USER=@controller:matrix.invalid', result)
+        self.assertIn('MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON={}', result)
+
+    def test_runtime_transform_canonicalizes_additional_control_rooms(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.runtime_source(folder)
+            source.write_text(source.read_text() +
+                              'MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON=' +
+                              '{"@zeta:example.invalid":"!zeta:example.invalid",'
+                              '"@alpha:example.invalid":"!alpha:example.invalid"}\n')
+            result = manager.final_runtime_env(source).decode()
+        self.assertIn(
+            'MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON='
+            '{"@alpha:example.invalid":"!alpha:example.invalid",'
+            '"@zeta:example.invalid":"!zeta:example.invalid"}', result)
+
+    def test_runtime_transform_rejects_invalid_additional_control_rooms(self):
+        too_many = {f'@user{index}:example.invalid': f'!room{index}:example.invalid'
+                    for index in range(9)}
+        cases = (
+            '[]',
+            '{',
+            '{"not-a-user":"!room:example.invalid"}',
+            '{"@user:example.invalid":"not-a-room"}',
+            ('{"@same:example.invalid":"!one:example.invalid",'
+             '"@same:example.invalid":"!two:example.invalid"}'),
+            ('{"@one:example.invalid":"!same:example.invalid",'
+             '"@two:example.invalid":"!same:example.invalid"}'),
+            '{"@controller:matrix.invalid":"!other:example.invalid"}',
+            '{"@other:example.invalid":"!control:x"}',
+            '{"@other:example.invalid":"!prod:x"}',
+            json.dumps(too_many, separators=(',', ':')),
+        )
+        for index, raw in enumerate(cases):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as folder:
+                source = self.runtime_source(folder)
+                source.write_text(source.read_text() +
+                                  'MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON=' + raw + '\n')
+                with self.assertRaisesRegex(
+                        manager.DeployError, 'matrix_additional_control_rooms_invalid'):
+                    manager.final_runtime_env(source)
 
     def test_runtime_transform_requires_explicit_control_user(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -163,6 +204,12 @@ class DeploymentTests(unittest.TestCase):
             state = Path(folder)
             control = state / 'control/state.json'
             control.parent.mkdir(mode=0o700)
+            ready = state / 'control/ready.json'
+            runtime = state / 'runtime.env'
+            runtime.write_text('MATRIX_CONTROL_USER=@controller:matrix.invalid\n'
+                               'MATRIX_CONSOLE_ROOM_ID=!control:x\n'
+                               'MATRIX_ROOM_ID=!prod:x\n'
+                               'MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON={}\n')
             identity = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
             waits = []
 
@@ -170,19 +217,52 @@ class DeploymentTests(unittest.TestCase):
                 waits.append(seconds)
                 control.write_text('{"since":"cursor","ai_enabled":false}\n')
                 control.chmod(0o600)
+                ready.write_text(json.dumps({
+                    'version': 1, 'pid': 123,
+                    'controllers_sha256': manager.control_bindings_hash(
+                        '@controller:matrix.invalid', '!control:x', {})}) + '\n')
+                ready.chmod(0o600)
 
             release = Path('/srv/methodenbot-final/releases/final-one')
             with (patch.object(manager, 'STATE', state),
+                  patch.object(manager, 'RUNTIME_ENV', runtime),
                   patch.object(manager, 'service_snapshot', return_value=123)):
                 result = manager.wait_control_ready(
                     release, 123, identity, attempts=2, sleep=finish_bootstrap)
             self.assertEqual(result['since'], 'cursor')
             self.assertEqual(waits, [1])
 
-            with patch.object(manager, 'service_snapshot', return_value=124):
+            with (patch.object(manager, 'RUNTIME_ENV', runtime),
+                  patch.object(manager, 'service_snapshot', return_value=124)):
                 with self.assertRaisesRegex(manager.DeployError, 'service_not_stable'):
                     manager.wait_control_ready(release, 123, identity, attempts=1,
                                                sleep=lambda _seconds: None)
+
+    def test_control_readiness_rejects_marker_for_other_controller_mapping(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            control_dir = state / 'control'
+            control_dir.mkdir(mode=0o700)
+            control = control_dir / 'state.json'
+            control.write_text('{"since":"cursor","ai_enabled":false}\n')
+            control.chmod(0o600)
+            ready = control_dir / 'ready.json'
+            ready.write_text(json.dumps({
+                'version': 1, 'pid': 123, 'controllers_sha256': '0' * 64}) + '\n')
+            ready.chmod(0o600)
+            runtime = state / 'runtime.env'
+            runtime.write_text('MATRIX_CONTROL_USER=@controller:matrix.invalid\n'
+                               'MATRIX_CONSOLE_ROOM_ID=!control:x\n'
+                               'MATRIX_ROOM_ID=!prod:x\n'
+                               'MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON={}\n')
+            identity = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+            with (patch.object(manager, 'STATE', state),
+                  patch.object(manager, 'RUNTIME_ENV', runtime),
+                  patch.object(manager, 'service_snapshot', return_value=123)):
+                with self.assertRaisesRegex(manager.DeployError, 'control_state_invalid'):
+                    manager.wait_control_ready(
+                        Path('/srv/methodenbot-final/releases/final-one'), 123, identity,
+                        attempts=1, sleep=lambda _seconds: None)
 
     def test_restore_failure_is_explicit_and_leaves_service_stopped(self):
         restore = Mock()

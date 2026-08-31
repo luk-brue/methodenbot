@@ -54,8 +54,9 @@ def main():
 
     bot = MatrixBot(config)
     bot.token_whoami()
-    validate_control_room(bot, config)
-    print('matrix_identity_and_control_room=ok')
+    for control_user, room_id in config.control_bindings():
+        validate_control_room(bot, config, room_id=room_id, control_user=control_user)
+    print('matrix_identity_and_control_rooms=ok')
 
     exchange = exchangemail.init_exchange_connection(config)
     items = select_latest_requests(exchange, 3)

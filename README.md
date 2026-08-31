@@ -1,8 +1,8 @@
 # Methodenbot – finale Fassung
 
 Stand: 31.08.2026. Diese Arbeitskopie verbindet den bisherigen produktiven
-Methodenbot mit der getesteten GWDG-KI-Zusammenfassung und einer eng begrenzten
-persönlichen Matrix-Steuerung.
+Methodenbot mit der getesteten GWDG-KI-Zusammenfassung und einer explizit
+freigegebenen persönlichen Matrix-Steuerung für mehrere Verantwortliche.
 
 ## Verhalten
 
@@ -28,6 +28,11 @@ sie wird nicht ohne den vorgesehenen KI-Beitrag als erledigt markiert.
 
 ## Persönliche Befehle
 
+Die primäre Kontrollperson und jede zusätzliche, ausdrücklich konfigurierte
+Kontrollperson dürfen dieselben vier Befehle verwenden. Jede Person arbeitet in
+einer eigenen exklusiven Bot-Zweier-PN; private Ergebnisse und Fehler werden nie
+in den Chat einer anderen Kontrollperson umgeleitet.
+
 Nur exakt diese vier reinen Textnachrichten werden akzeptiert:
 
 - `KI an` – prüft die administrative Freigabe und schaltet KI global ein;
@@ -45,31 +50,39 @@ Der zum Zeitpunkt des Befehls gültige KI-Schalter gilt für den ganzen Test. Be
 `Test 2` erzeugt jedoch absichtlich eine echte, nicht automatisch widerrufbare
 Matrix-Nachricht.
 
-`Test` und `Test 2` werden vor Exchange- oder KI-Arbeit sofort im privaten
-Kontrollraum bestätigt. Bei eingeschalteter KI weist die Bestätigung darauf hin,
-dass die Vorbereitung mehrere Minuten dauern kann. Die Verarbeitung bleibt seriell;
-weitere Testbefehle werden nach dem laufenden Test eingelesen und bearbeitet.
+`Test` und `Test 2` werden vor Exchange- oder KI-Arbeit sofort in der jeweiligen
+privaten Unterhaltung bestätigt. Eigene Raumpoller bleiben auch während eines
+laufenden Tests ansprechbar. Ein gemeinsamer Worker verarbeitet alle Befehle
+seriell, damit sich KI-Aufrufe, globale Schalteränderungen und echte
+`Test 2`-Zustellungen nicht überholen.
 
 ## Sicherheitsgrenzen der Steuerung
 
 Ein Befehl gilt ausschließlich, wenn er
 
-- von der explizit in `MATRIX_CONTROL_USER` konfigurierten Person stammt;
-- im ausdrücklich konfigurierten `MATRIX_CONSOLE_ROOM_ID` eintrifft;
+- von der für genau diesen Raum explizit konfigurierten Person stammt;
+- im zu dieser Person gehörenden Kontrollraum eintrifft;
 - eine unveränderte `m.text`-Nachricht ist, nicht Edit, Antwort oder Thread;
 - aus einem unverschlüsselten Zweierraum mit genau Bot und Kontrollperson stammt;
 - in einem Raum mit Einladungs- und Power-Level-Schutz liegt, in dem die Kontrollperson
   weder weitere Mitglieder einladen noch Sicherheitszustände ändern kann.
 
-Die fehlende Ende-zu-Ende-Verschlüsselung muss mit
+Das primäre Paar wird mit `MATRIX_CONTROL_USER` und `MATRIX_CONSOLE_ROOM_ID`
+konfiguriert. Weitere Paare stehen als User-zu-Raum-Objekt in
+`MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON`. Doppelte Personen oder Räume sowie eine
+Kollision mit dem produktiven Zielraum werden abgelehnt. Die fehlende
+Ende-zu-Ende-Verschlüsselung muss mit
 `MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM=true` ausdrücklich freigegeben sein. Beim
-allerersten Start wird nur der aktuelle `/sync`-Cursor gespeichert; vorhandene
-alte Chatnachrichten werden nicht ausgeführt. Begrenzte Timelines oder ein
-unsicherer Raum führen zu einem fail-closed Stopp der Steuerung.
+allerersten Start eines Raums wird nur dessen aktueller `/sync`-Cursor gespeichert;
+vorhandene alte Chatnachrichten werden nicht ausgeführt. Begrenzte Timelines oder
+ein unsicherer Raum führen für diesen Raum zu einem fail-closed Stopp. Start und
+Live-Preflight validieren alle konfigurierten Räume.
 
 Nach der idempotenten privaten Wartebestätigung werden alle Testinhalte vor ihrem
-ersten Matrix-Versand vollständig eingefroren und in
-`/var/lib/methodenbot/control/state.json` mit Modus 0600 journalisiert.
+ersten Matrix-Versand vollständig eingefroren und in einem raumgebundenen Journal
+mit Modus 0600 gespeichert. Der bisherige primäre Zustand bleibt unverändert unter
+`/var/lib/methodenbot/control/state.json`; zusätzliche Zustände liegen unter
+gehashten Unterverzeichnissen.
 Deterministische Matrix-Transaktions-IDs, Readback und ein geschützter persistenter
 Matrix-Token verhindern Wiederholungen nach einem Crash. Erledigte Nachrichteninhalte
 werden aus dem Journal entfernt. Vorübergehende Zustellfehler werden höchstens fünfmal
@@ -126,7 +139,9 @@ Codepfad, Prozess und stabile PID anschließend verifiziert sind; andernfalls bl
 der Dienst absichtlich gestoppt und meldet den Restore-Fehler eindeutig. Der
 ausgegebene Backupname kann zusätzlich nur in der dazu passenden aktiven Release-Linie
 für `rollback --backup NAME --confirm-restart` verwendet werden. Folgereleases
-bewahren die kanonische `runtime.env`, den lokalen Token, CSVs und den KI-Schalter.
+bewahren die kanonische `runtime.env`, den lokalen Token, CSVs und den globalen
+KI-Schalter. Die Aktivierung gilt erst als bereit, wenn alle konfigurierten
+Raumpoller derselben stabilen Dienst-PID initialisiert wurden.
 
 ## Tests
 
@@ -138,8 +153,9 @@ Offline, ohne Netzwerk:
 ```
 
 Abgedeckt sind unter anderem Parserkompatibilität, KI-Redaktion und -Pacing,
-exakte Befehlsautorisierung, Erststart ohne History-Replay, Toggle-Reihenfolge,
-falsche/unsichere Räume, Zielräume für `Test`/`Test 2`, KI-aus ohne Modellaufruf,
+exakte raumgebundene Befehlsautorisierung, Erststart ohne History-Replay,
+Mehrraum-Polling, globale Toggle-Reihenfolge, falsche/unsichere Räume, Zielräume
+für `Test`/`Test 2`, KI-aus ohne Modellaufruf,
 Matrix-401-Reauthentifizierung samt persistiertem Token, echte Zustandsneustarts,
 Crash-Idempotenz, begrenzte Zustellfehler, globale Mailauswahl und fail-closed CSV-Zustand.
 

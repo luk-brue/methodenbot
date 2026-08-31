@@ -5,8 +5,8 @@ Stand: 31.08.2026
 ## Kurzfassung
 
 Diese Fassung enthält sämtliche bisherigen Parser-/Matrix-Fixes, die
-GWDG-KI-Zusammenfassung und vier persönliche Steuerbefehle für die konfigurierte
-Kontrollperson. Der
+GWDG-KI-Zusammenfassung und vier persönliche Steuerbefehle für ausdrücklich
+konfigurierte Kontrollpersonen. Der
 Produktionsdienst soll aus einem unveränderlichen Release unter
 `/srv/methodenbot-final/current` laufen. Zugangsdaten und Laufzeitdaten liegen
 außerhalb des Releases.
@@ -26,22 +26,27 @@ Bei einem Fehler bleiben die Originaldetails erhalten.
 
 ## Persönliche Steuerung
 
-Nur die in `MATRIX_CONTROL_USER` konfigurierte Person darf in der fest
-konfigurierten privaten Zweierunterhaltung exakt folgende Nachrichten senden:
+Die primäre und jede in `MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON` ergänzte Person
+darf in ihrer jeweils eigenen, fest konfigurierten privaten Zweierunterhaltung
+exakt folgende Nachrichten senden:
 
 - `KI an`
 - `KI aus`
 - `Test`
 - `Test 2`
 
-`Test` kopiert die letzten drei echten Anfragen in diese PN. `Test 2` kopiert
+`Test` kopiert die letzten drei echten Anfragen ausschließlich in die PN der
+auslösenden Person. `Test 2` kopiert
 die neueste Anfrage mit dem sichtbaren Beginn `Techniktest` in den produktiven
 Zielraum. Beide Pfade sind read-only gegenüber Exchange, Processed-CSV und
 Statistik. `Test 2` ist trotzdem ein realer Matrix-Seiteneffekt.
 
-Beide Testbefehle werden sofort privat bestätigt, bevor Exchange und gegebenenfalls
-die KI arbeiten. Bei eingeschalteter KI nennt die Bestätigung die mögliche Wartezeit;
-weitere Testbefehle werden seriell nach dem laufenden Test bearbeitet.
+Beide Testbefehle werden sofort im auslösenden Chat bestätigt, bevor Exchange und
+gegebenenfalls die KI arbeiten. Eigene Poller halten alle Kontrollräume während
+langer Tests ansprechbar; ein gemeinsamer Worker führt sämtliche Befehle seriell
+aus. Der KI-Schalter ist global. Deshalb darf jede konfigurierte Person den
+Produktionsmodus für alle ändern; ebenso darf jede mit `Test 2` eine echte,
+nicht automatisch widerrufbare Nachricht im Zielraum auslösen.
 
 Alte Chatnachrichten werden beim ersten Start nicht ausgeführt. Kontrollbefehle
 werden mit Cursor, Journal, stabilen Transaktions-IDs, persistenter Matrix-Sitzung
@@ -53,7 +58,7 @@ Befehle bleiben ausführbar.
 
 ## Wichtige Dateien
 
-- `main.py` – produktiver Einstieg und paralleler Kontroll-Listener
+- `main.py` – produktiver Einstieg, getrennte Raumpoller und serieller Worker
 - `matrix_commands.py` – Autorisierung, `/sync`, Befehlsausführung und Readback
 - `control_state.py` – atomarer 0600-Zustand und Prozess-Lock
 - `manual_delivery.py` – read-only Auswahl und Test-Rendering

@@ -22,6 +22,8 @@ FILES = (
     'tests/test_matrixbot_final.py',
     'tests/test_deployment.py',
     'tests/test_control_state.py',
+    'tests/test_multi_control_config.py',
+    'tests/test_multi_controller.py',
     'deployment/build_bundle.py', 'deployment/manage.py',
     'deployment/runtime_preflight.py',
 )
