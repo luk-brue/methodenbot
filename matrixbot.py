@@ -1,134 +1,342 @@
-import configparser
-import logging
-import os
+"""Small, non-E2EE Matrix client used by the Methodenbot.
+
+All retries of a send retain the same Matrix transaction identifier. Response
+bodies are never logged because they can contain message text or credentials.
+"""
+
 import json
-import requests
+import logging
+import math
+import os
+from pathlib import Path
+import stat
+import threading
 import time
 import uuid
+from urllib.parse import quote, urlsplit
 
-from oauthlib.oauth1.rfc5849.endpoints import access_token
+import requests
 
-# own stuff:
-from configuration import Configuration
 
-# Logging konfigurieren
 logger = logging.getLogger(__name__)
+MAX_EVENT_CONTENT_BYTES = 48_000
+
+
+class MatrixError(RuntimeError):
+    def __init__(self, code, *, status=None):
+        super().__init__(code)
+        self.status = status
+
+
+def matrix_message_content(msg, html_msg=None, thread_reply_to=None):
+    """Build and wire-measure exactly the content sent through requests' json= API."""
+    if not isinstance(msg, str) or not msg:
+        raise MatrixError('invalid_matrix_message')
+    content = {'msgtype': 'm.text', 'body': msg}
+    if thread_reply_to is not None:
+        if not isinstance(thread_reply_to, str) or not thread_reply_to.startswith('$'):
+            raise MatrixError('invalid_matrix_thread_root')
+        content['m.relates_to'] = {'rel_type': 'm.thread', 'event_id': thread_reply_to}
+    if html_msg is not None:
+        if not isinstance(html_msg, str):
+            raise MatrixError('invalid_matrix_html')
+        content.update({'format': 'org.matrix.custom.html', 'formatted_body': html_msg})
+    size = len(json.dumps(content, ensure_ascii=True, allow_nan=False).encode('utf-8'))
+    return content, size
+
 
 class MatrixBot:
-    """
-    Tries to connect the bot to the Client-Server-API, using either a cached AccessToken or
-    tries to obtain a token using password login. 
-    No methods for cryptography provided here. 
-    """
-    def __init__(self, envvars: Configuration):
-        logger.info("Starting matrix bot.")
-        self.device_id = None
-        self.access_token = None
-        self.homeserver = envvars.matrix_server
+    """Password-authenticated Matrix client without encryption support."""
+
+    def __init__(self, envvars, *, session_factory=requests.Session, sleep=time.sleep):
+        endpoint = urlsplit((envvars.matrix_server or '').rstrip('/'))
+        if (endpoint.scheme != 'https' or not endpoint.hostname or endpoint.username
+                or endpoint.password or endpoint.query or endpoint.fragment):
+            raise MatrixError('invalid_matrix_endpoint')
+        self.homeserver = (envvars.matrix_server or '').rstrip('/')
         self.username = envvars.matrix_user
         self.password = envvars.matrix_password
         self.room_id = envvars.matrix_room_id
+        self.requested_device_id = getattr(envvars, 'matrix_device_id', None)
+        token_file = getattr(envvars, 'matrix_token_file', None)
+        self.token_file = Path(token_file) if isinstance(token_file, str) and token_file else None
+        if not isinstance(self.requested_device_id, str) or not self.requested_device_id.strip():
+            raise MatrixError('missing_matrix_device_id')
+        self._session_factory = session_factory
+        self._sleep = sleep
+        self._login_lock = threading.Lock()
+        self.access_token = None
+        self.device_id = None
+        self.user_id = None
+        if not self._load_token():
+            self.password_login()
+        else:
+            body = self.request_json('GET', '/account/whoami')
+            if (body.get('user_id') != self.user_id
+                    or body.get('device_id', self.device_id) != self.device_id):
+                raise MatrixError('matrix_cached_identity_changed')
 
-        self.password_login()
-        if self.access_token is None:
-            logger.exception("Matrix Access Token could not be obtained for some reason.") 
+    def _session(self):
+        session = self._session_factory()
+        if hasattr(session, 'trust_env'):
+            session.trust_env = False
+        return session
 
-       
-    def password_login(self):
-        response = requests.post(f"{self.homeserver}/_matrix/client/v3/login",
-            json = {
-                "type": "m.login.password",
-                "user": self.username,
-                "password": self.password
-            })
+    @staticmethod
+    def _json(response):
+        content = getattr(response, 'content', b'')
+        if isinstance(content, (bytes, bytearray)) and len(content) > 2_000_000:
+            raise MatrixError('matrix_response_too_large')
         try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e: 
-            logger.exception("Error at login with password:")
-            logger.info("Retry in 10 seconds...")
-            time.sleep(10)
-            response = requests.post(f"{self.homeserver}/_matrix/client/v3/login", 
-                json = {
-                    "type": "m.login.password",
-                    "user": self.username,
-                    "password": self.password
-                })
-            response.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            logger.exception(f"Non-HTTP-Fehler at Matrix login with password: {e}",)
+            value = response.json()
+        except (ValueError, TypeError, RecursionError):
+            raise MatrixError('matrix_invalid_json', status=getattr(response, 'status_code', None)) from None
+        if not isinstance(value, dict):
+            raise MatrixError('matrix_invalid_json', status=getattr(response, 'status_code', None))
+        return value
 
+    def _load_token(self):
+        if self.token_file is None:
+            return False
         try:
-            response_body = json.loads(response.text)
-            self.access_token = response_body['access_token']
-            self.device_id = response_body['device_id']
-        except Exception:
-            logger.exception("Error during parsing of request body after login of the matrix bot.")
+            os.lstat(self.token_file)
+        except FileNotFoundError:
+            return False
+        try:
+            fd = os.open(self.token_file, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'rb') as handle:
+                metadata = os.fstat(handle.fileno())
+                if (not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600
+                        or metadata.st_uid != os.geteuid() or metadata.st_size > 20_000):
+                    raise MatrixError('unsafe_matrix_token_file')
+                raw = handle.read(20_001)
+            value = json.loads(raw.decode('utf-8'))
+        except MatrixError:
             raise
-        logger.info("Matrix Bot erfolgreich eingeloggt mit Passwort.")
-        
+        except (OSError, UnicodeError, ValueError, RecursionError):
+            raise MatrixError('matrix_token_file_unreadable') from None
+        if (not isinstance(value, dict) or set(value) != {
+                'version', 'access_token', 'device_id', 'user_id', 'login_user'}
+                or value.get('version') != 2 or not isinstance(value.get('access_token'), str)
+                or not value['access_token'] or value.get('device_id') != self.requested_device_id
+                or value.get('login_user') != self.username
+                or not isinstance(value.get('user_id'), str) or not value['user_id'].startswith('@')):
+            raise MatrixError('matrix_token_file_invalid')
+        self.access_token = value['access_token']
+        self.device_id = value['device_id']
+        self.user_id = value['user_id']
+        return True
+
+    def _store_token(self):
+        if self.token_file is None:
+            return
+        self.token_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = os.lstat(self.token_file.parent)
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077):
+            raise MatrixError('unsafe_matrix_token_directory')
+        try:
+            existing = os.lstat(self.token_file)
+            if (not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.geteuid()
+                    or stat.S_IMODE(existing.st_mode) != 0o600):
+                raise MatrixError('unsafe_matrix_token_file')
+        except FileNotFoundError:
+            pass
+        data = {'version': 2, 'access_token': self.access_token, 'login_user': self.username,
+                'device_id': self.device_id, 'user_id': self.user_id}
+        raw = (json.dumps(data, separators=(',', ':')) + '\n').encode('utf-8')
+        temporary = self.token_file.parent / ('.matrix-session.' + uuid.uuid4().hex)
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.token_file)
+            directory_fd = os.open(self.token_file.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def password_login(self, expected_old_token=None):
+        """Refresh once; another thread's newer token is never overwritten."""
+        with self._login_lock:
+            if expected_old_token is not None and self.access_token != expected_old_token:
+                return
+            payload = {
+                'type': 'm.login.password',
+                'identifier': {'type': 'm.id.user', 'user': self.username},
+                'password': self.password,
+                'device_id': self.requested_device_id,
+                'initial_device_display_name': 'Methodenbot final',
+            }
+            try:
+                with self._session() as session:
+                    response = session.post(self.homeserver + '/_matrix/client/v3/login', json=payload,
+                                            timeout=(5, 20), allow_redirects=False)
+            except requests.RequestException:
+                raise MatrixError('matrix_login_network_error') from None
+            if response.status_code != 200:
+                raise MatrixError('matrix_login_failed', status=response.status_code)
+            body = self._json(response)
+            token, device_id = body.get('access_token'), body.get('device_id')
+            user_id = body.get('user_id', self.username)
+            if (not isinstance(token, str) or not token or not isinstance(device_id, str)
+                    or device_id != self.requested_device_id or not isinstance(user_id, str)
+                    or not user_id.startswith('@')):
+                raise MatrixError('matrix_login_response_invalid')
+            self.access_token, self.device_id, self.user_id = token, device_id, user_id
+            self._store_token()
+            logger.info('Matrix-Bot erfolgreich angemeldet.')
+
+    @staticmethod
+    def _retry_delay(response):
+        header = response.headers.get('Retry-After') if hasattr(response, 'headers') else None
+        try:
+            if header is not None:
+                return max(0, math.ceil(float(header)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            value = response.json().get('retry_after_ms')
+            if type(value) in (int, float) and value >= 0:
+                return math.ceil(value / 1000)
+        except (ValueError, TypeError, AttributeError):
+            pass
+        return 1
+
+    def request_json(self, method, path, *, payload=None, params=None, expected=(200,),
+                     authenticated=True, idempotent=None, timeout=(5, 30)):
+        if method not in ('GET', 'POST', 'PUT') or not isinstance(path, str) or not path.startswith('/'):
+            raise MatrixError('matrix_request_not_allowed')
+        if idempotent is None:
+            idempotent = method in ('GET', 'PUT')
+        refreshed = False
+        attempts = 0
+        while True:
+            attempts += 1
+            token = self.access_token
+            headers = {'Authorization': 'Bearer ' + token} if authenticated else {}
+            try:
+                with self._session() as session:
+                    response = session.request(method, self.homeserver + '/_matrix/client/v3' + path,
+                                               headers=headers, json=payload, params=params, timeout=timeout,
+                                               allow_redirects=False)
+            except requests.RequestException:
+                if idempotent and attempts < 3:
+                    self._sleep(1)
+                    continue
+                raise MatrixError('matrix_network_error') from None
+            if authenticated and response.status_code == 401 and not refreshed:
+                self.password_login(expected_old_token=token)
+                refreshed = True
+                continue
+            if response.status_code == 429 and idempotent and attempts < 3:
+                delay = self._retry_delay(response)
+                if delay <= 120:
+                    self._sleep(delay)
+                    continue
+            if response.status_code not in expected:
+                if idempotent and response.status_code in (500, 502, 503, 504) and attempts < 3:
+                    self._sleep(1)
+                    continue
+                raise MatrixError('matrix_http_error', status=response.status_code)
+            return self._json(response)
+
     def token_whoami(self):
-        response = requests.get(
-        f'{self.homeserver}/_matrix/client/v3/account/whoami',
-            headers={'Authorization': f'Bearer {self.access_token}'}
-        )
-        try:
-            response.raise_for_status()
-            logger.info("Matrix Bot erfolgreich mit API verbunden über AccessToken.")
-            return response.status_code
-        except requests.exceptions.HTTPError as e: 
-            logger.exception("Fehler bei Whoami-API Anfrage des Matrix Bots mit AccessToken")
-            return response.status_code
-    
-    def send_message(self, msg, room_id=None, thread_reply_to=None, html_msg=None):
-        """
-        Send Matrix Message to room, optionally reply in thread. 
-        Will try to reauthenticate if response returns 401 status code.
+        body = self.request_json('GET', '/account/whoami')
+        user_id = body.get('user_id')
+        if (not isinstance(user_id, str) or user_id != self.user_id
+                or body.get('device_id', self.device_id) != self.device_id):
+            raise MatrixError('matrix_identity_changed')
+        return 200
 
-        Arguments:
-        - msg: String, Message. Markdown formatting possible
-        Optional:
-        - room_id: String, The room id where the message should be sent to. 
-        - thread_reply_to: String, a Matrix event_id of the message to which a thread should be opened or continued. Event_ids of messages that are already in a thread will lead to a 400 HTTPError
-        """
-        if room_id is None:
-            room_id = self.room_id
-        random_uuid = str(uuid.uuid4())
-        url = f'{self.homeserver}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{random_uuid}'
-        headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"}
-        payload = {
-            "msgtype": "m.text",
-            "body": msg}
-        if thread_reply_to is not None:
-            payload.update({
-                "m.relates_to": {
-                    "rel_type": "m.thread",
-                    "event_id": thread_reply_to
-                    }
-            })
-        if html_msg is not None:
-            payload.update({
-                "format": "org.matrix.custom.html",
-                "formatted_body": html_msg
-             })
-        response = requests.put(url, headers=headers, json=payload, timeout=15)
-        logger.debug(f"Response Text: {response.text}")
+    def send_message(self, msg, room_id=None, thread_reply_to=None, html_msg=None,
+                     transaction_id=None):
+        room_id = room_id or self.room_id
+        if not isinstance(room_id, str) or not room_id.startswith('!'):
+            raise MatrixError('invalid_matrix_room')
+        transaction_id = transaction_id or ('auto-' + uuid.uuid4().hex)
+        if (not isinstance(transaction_id, str) or not 1 <= len(transaction_id) <= 200
+                or any(ord(char) < 33 or ord(char) > 126 for char in transaction_id)):
+            raise MatrixError('invalid_matrix_transaction_id')
+        content, content_size = matrix_message_content(msg, html_msg, thread_reply_to)
+        if content_size > MAX_EVENT_CONTENT_BYTES:
+            raise MatrixError('matrix_message_too_large')
+        path = ('/rooms/' + quote(room_id, safe='') + '/send/m.room.message/'
+                + quote(transaction_id, safe=''))
+        event_id = self.request_json('PUT', path, payload=content, idempotent=True).get('event_id')
+        if not isinstance(event_id, str) or not event_id.startswith('$'):
+            raise MatrixError('matrix_send_unconfirmed')
+        logger.info('Matrix-Nachricht bestätigt.')
+        return event_id
 
+    def read_event(self, room_id, event_id):
+        if not isinstance(room_id, str) or not room_id.startswith('!'):
+            raise MatrixError('invalid_matrix_room')
+        if not isinstance(event_id, str) or not event_id.startswith('$'):
+            raise MatrixError('invalid_matrix_event')
+        return self.request_json('GET', '/rooms/' + quote(room_id, safe='') + '/event/'
+                                 + quote(event_id, safe=''))
+
+    def _request_array(self, path):
+        token = self.access_token
+        for refreshed in (False, True):
+            try:
+                with self._session() as session:
+                    response = session.get(self.homeserver + '/_matrix/client/v3' + path,
+                                           headers={'Authorization': 'Bearer ' + self.access_token},
+                                           timeout=(5, 30), allow_redirects=False)
+            except requests.RequestException:
+                raise MatrixError('matrix_network_error') from None
+            if response.status_code == 401 and not refreshed:
+                self.password_login(expected_old_token=token)
+                continue
+            if response.status_code != 200:
+                raise MatrixError('matrix_http_error', status=response.status_code)
+            try:
+                value = response.json()
+            except (ValueError, TypeError, RecursionError):
+                raise MatrixError('matrix_invalid_json') from None
+            if not isinstance(value, list) or len(value) > 20_000:
+                raise MatrixError('matrix_invalid_state')
+            return value
+        raise MatrixError('matrix_auth_failed')
+
+    def get_room_state(self, room_id):
+        return self._request_array('/rooms/' + quote(room_id, safe='') + '/state')
+
+    def direct_mapping(self):
+        if not isinstance(self.user_id, str):
+            raise MatrixError('matrix_identity_missing')
+        return self.request_json('GET', '/user/' + quote(self.user_id, safe='')
+                                 + '/account_data/m.direct', expected=(200, 404))
+
+    def sync(self, *, since=None, room_id=None, timeout_ms=30_000):
+        if since is not None and (not isinstance(since, str) or not since):
+            raise MatrixError('invalid_sync_cursor')
+        if not isinstance(timeout_ms, int) or not 0 <= timeout_ms <= 60_000:
+            raise MatrixError('invalid_sync_timeout')
+        room_filter = {'timeline': {'limit': 50}, 'state': {'lazy_load_members': False},
+                       'ephemeral': {'types': []}, 'account_data': {'types': []}}
+        if room_id is not None:
+            room_filter['rooms'] = [room_id]
+        params = {'timeout': timeout_ms, 'filter': json.dumps({
+            'room': room_filter, 'presence': {'types': []}}, separators=(',', ':'))}
+        if since is not None:
+            params['since'] = since
+        return self.request_json('GET', '/sync', params=params,
+                                 timeout=(5, max(30, timeout_ms / 1000 + 10)))
+
+    def logout(self):
         try:
-            response.raise_for_status()
-            logger.info("Matrix-Bot hat Nachricht gesendet.")
-            return json.loads(response.text)['event_id']
-        except requests.exceptions.HTTPError:
-            logger.exception("Fehler beim Senden der Nachricht:")
-            # in case token expired:
-            if response.status_code == 401:
-                self.password_login()
-                response = requests.put(url, headers=headers, json=payload, timeout=15)
-                logger.debug(f"Response Text: {response.text}")
-                response.raise_for_status()
-                logger.info("Matrix-Bot hat Nachricht gesendet.")
-                return None
-            elif response.status_code == 400:
-                logger.error("Möglicherweise wurde im Argument thread_reply_to eine event_id angegeben, die zu einer Nachricht gehört die bereits in einem Thread ist - Matrix erlaubt keine genesteten Threads.")
-                raise
-            else: 
-                raise
+            self.request_json('POST', '/logout', payload={}, idempotent=False)
+            return True
+        except MatrixError:
+            return False

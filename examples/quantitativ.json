@@ -1,0 +1,15 @@
+{
+  "request": {
+    "beschreibung": "Für meine quantitative Studie untersuche ich Stress über drei Messzeitpunkte. Geplant ist ein lineares gemischtes Modell mit zufälligem Interzept pro Person.",
+    "fragen": "Bei der Modellschätzung erhalte ich in R mit lme4 eine Konvergenzwarnung. Wie kann ich die Ursache eingrenzen?",
+    "rskript": "lmer(stress ~ zeit + (1 | person), data = daten)"
+  },
+  "fixture_response": {
+    "kurzfassung": "Hilfe beim Eingrenzen einer Konvergenzwarnung in R/lme4 gesucht. Betroffen ist ein lineares gemischtes Modell für wiederholte Stressmessungen.",
+    "analyseart": {"wert": "quantitativ", "status": "genannt", "beleg": "quantitative Studie"},
+    "analyseschritt": {"wert": "Modellschätzung und Fehlersuche bei Konvergenz", "status": "genannt", "beleg": "Bei der Modellschätzung erhalte ich in R mit lme4 eine Konvergenzwarnung"},
+    "software": {"wert": "R, Paket lme4", "status": "genannt", "beleg": "in R mit lme4"},
+    "statistisches_modell": {"wert": "Lineares gemischtes Modell mit zufälligem Interzept", "status": "genannt", "beleg": "lineares gemischtes Modell mit zufälligem Interzept pro Person"},
+    "offene_punkte": []
+  }
+}

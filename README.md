@@ -1,100 +1,150 @@
-# methodenbot
-Bridge from Exchange mail inbox to Matrix channel. 
+# Methodenbot – finale Fassung
 
-### Beschreibung
+Stand: 31.08.2026. Diese Arbeitskopie verbindet den bisherigen produktiven
+Methodenbot mit der getesteten GWDG-KI-Zusammenfassung und einer eng begrenzten
+persönlichen Matrix-Steuerung.
 
-Kann ein Exchange-Gruppen-Email-Postfach auf neue Nachrichten in der INBOX abhören. Neue Nachrichten werden gefiltert, je nachdem ob es sich um ein von TYPO3 versendetes Kontaktformular handelt oder nicht. Wenn es ein Kontaktformular ist, wird der relevante Inhalt ausgelesen. Über Matrix wird dann eine formatierte Nachricht mit dem Inhalt des Formulars versendet, in einen vorgegebenen Raum. 
-Dabei werden zunächst die wichtigsten Informationen zusammengefasst in einer kurzen Nachricht und die Details werden gepostet in eine Thread-Antwort darauf. Schließlich wird ein Google-Forms Link erzeugt, der die Informationen aus dem Kontaktformular vorausgefüllt hat. Der wird dann auch in den Thread gepostet. 
+## Verhalten
 
-### Setup
+Normale TYPO3-Beratungsanfragen werden weiterhin im produktiven Matrix-Raum
+veröffentlicht. Die Hauptnachricht erhält darunter Geschwisterantworten:
 
-**Voraussetzungen**
+1. optional die klar als KI-generiert markierte Zusammenfassung;
+2. die unveränderten Originaldetails mit Protokoll-Link.
 
-- Python3, pip
-- optimal: dauerhaft laufender Rechner, der das Skript kontinuierlich ausführt. Aber auch nach Ausfällen bei Neustarts werden die 100 neuesten Emails im INBOX-Ordner geholt.
-- Der Rechner muss nur Anfragen ins Internet senden können, selbst aber keine Anfragen entgegennehmen. Optimal für strenge Firewalls wie z.B. in der Uni. 
-- Es wird ein Matrix Account benötigt mit Passwort und Username
-- Adresse des Matrix-Homeservers
-- Raum-ID eines Matrix Raums, in welchen die Nachrichten gepostet werden.
-- Exchange-Email-Adresse - muss kein Gruppenpostfach sein, kann aber eins sein.
-- Zugangsdaten für diese Exchange-Mail-Adresse, bei Gruppenpostfach die normalen Exchange Zugangsdaten einer Person die für das Postfach freigeschaltet ist. 
-- Serveradresse des Mailservers
-- Link zu einem passenden Google-Formular
+Die KI-Zusammenfassung nennt zuerst das eigentliche Beratungsanliegen und ordnet
+danach Analyseart, Analyseschritt, Software und statistisches Modell ein. Es werden
+bis zu drei brauchbare Entwürfe gesammelt und höchstens zehn gepacete Modellaufrufe
+pro Anfrage verwendet. Typisch sind vier Aufrufe. Sämtliche Aufrufe laufen seriell
+über `http://127.0.0.1:18765/v1/chat/completions`; der Bot erhält nur den lokalen
+Gateway-Token, nie den GWDG-Upstream-Schlüssel.
 
-**Vorgehensweise**
+Der persistente KI-Schalter startet bei der ersten Inbetriebnahme **aus**. Ein
+KI-Fehler unterdrückt niemals die Originaldetails; stattdessen erscheint ein
+sichtbarer Hinweis „KI-Zusammenfassung nicht verfügbar“. Ist dagegen die
+Matrix-Zustellung dieses KI-Beitrags selbst unbestätigt, bleibt die gesamte
+Anfrage unverarbeitet und wird mit denselben Transaktions-IDs erneut versucht;
+sie wird nicht ohne den vorgesehenen KI-Beitrag als erledigt markiert.
 
-- Klone dieses Repository.
-- Erstelle `.env` Datei darin. Enthält Konfigurationsvariablen, die als Umgebungsvariablen ausgelesen werden. Zum Aufbau der Datei siehe unten. Bitte Berechtigungen und Zugriff auf die Datei einschränken.
-- Erstelle ein virtuelles Environment für Python (`venv` oder `conda`)
-- Installiere Dependencies aus `requirements.txt`
-- `main.py` muss ausgeführt werden, um die Email-Matrix-Brücke laufen zu lassen. Es bietet sich an, auf Linux einen `systemd` Service einzurichten, der sich selbst neu startet bei Fehlern und nach dem Bootvorgang gestartet wird. 
+## Persönliche Befehle
 
-### .env
+Nur exakt diese vier reinen Textnachrichten werden akzeptiert:
 
-Beispiel einer .env-Datei:
+- `KI an` – prüft die administrative Freigabe und schaltet KI global ein;
+- `KI aus` – schaltet KI global aus;
+- `Test` – sendet die letzten drei unterschiedlichen TYPO3-Anfragen aus Inbox
+  und Korrespondenz chronologisch in die private Unterhaltung. Jede Hauptnachricht
+  beginnt mit `Test · n/3`;
+- `Test 2` – sendet die neueste Anfrage einmal in den echten Zielkanal. Die
+  Hauptnachricht beginnt exakt mit `Techniktest`; anschließend folgt eine private
+  Zustellbestätigung.
+
+Der zum Zeitpunkt des Befehls gültige KI-Schalter gilt für den ganzen Test. Bei
+`KI aus` erfolgen keinerlei KI-Aufrufe. `Test` und `Test 2` schreiben weder
+`processed_emails.csv` noch `stats.csv` und verändern keine Exchange-Nachricht.
+`Test 2` erzeugt jedoch absichtlich eine echte, nicht automatisch widerrufbare
+Matrix-Nachricht.
+
+## Sicherheitsgrenzen der Steuerung
+
+Ein Befehl gilt ausschließlich, wenn er
+
+- von der explizit in `MATRIX_CONTROL_USER` konfigurierten Person stammt;
+- im ausdrücklich konfigurierten `MATRIX_CONSOLE_ROOM_ID` eintrifft;
+- eine unveränderte `m.text`-Nachricht ist, nicht Edit, Antwort oder Thread;
+- aus einem unverschlüsselten Zweierraum mit genau Bot und Kontrollperson stammt;
+- in einem Raum mit Einladungs- und Power-Level-Schutz liegt, in dem die Kontrollperson
+  weder weitere Mitglieder einladen noch Sicherheitszustände ändern kann.
+
+Die fehlende Ende-zu-Ende-Verschlüsselung muss mit
+`MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM=true` ausdrücklich freigegeben sein. Beim
+allerersten Start wird nur der aktuelle `/sync`-Cursor gespeichert; vorhandene
+alte Chatnachrichten werden nicht ausgeführt. Begrenzte Timelines oder ein
+unsicherer Raum führen zu einem fail-closed Stopp der Steuerung.
+
+Geplante Zustellungen werden vor dem ersten Matrix-Versand vollständig eingefroren
+und in `/var/lib/methodenbot/control/state.json` mit Modus 0600 journalisiert.
+Deterministische Matrix-Transaktions-IDs, Readback und ein geschützter persistenter
+Matrix-Token verhindern Wiederholungen nach einem Crash. Erledigte Nachrichteninhalte
+werden aus dem Journal entfernt. Vorübergehende Zustellfehler werden höchstens fünfmal
+mit derselben Transaktions-ID versucht. Bei einem dauerhaften Fehler wird nur der
+betroffene Befehl beendet und eine private Warnung versucht; danach blockiert er keine
+späteren Steuerbefehle. Eine mögliche Teilzustellung wird dabei nicht blind wiederholt.
+
+Auch `processed_emails.csv` ist ein fail-closed Zustelljournal: vorhandene beschädigte,
+unsichere oder unlesbare Dateien stoppen den Dienst, statt als leere Liste interpretiert
+zu werden. Änderungen erfolgen atomar und werden auf Datei und Verzeichnis synchronisiert.
+
+## Laufzeitpfade
+
+- Code: `/srv/methodenbot-final/releases/<release>/`
+- aktiver Symlink: `/srv/methodenbot-final/current`
+- Konfiguration: `/etc/methodenbot/runtime.env`
+- lokaler Gateway-Token: systemd-Credential `gwdg-local-token`
+- verarbeitete IDs, Statistik, Matrix-Sitzung und Kontrollzustand:
+  `/var/lib/methodenbot/`
+- bestehende virtuelle Umgebung: `/home/methodenbot/methodenbot/venv`
+
+Der Releasebaum enthält keine `.env`, CSV, Logs, Token oder Schlüssel.
+
+## Bereitstellung
+
+Lokal wird ein manifestiertes, geheimnisfreies Bundle erzeugt:
+
+```sh
+python3 deployment/build_bundle.py
 ```
-MATRIX_SERVER="https://..." # Home-Server des Bots
-MATRIX_USER="uXXXX"         # Bot user
-MATRIX_PASSWORD="..."
-MATRIX_ROOM_ID = "!....:...." # ID des Raums, wohin der Bot eingehende Mail-Nachrichten senden soll.
-MATRIX_CONSOLE_ROOM_ID = "!...:..." # ID des Raums, wo der Bot auf Commands hört. 
-EMAIL_ADDRESS = "....@....de"  #  Exchange-E-Mail-Adresse
-EMAIL_PASSWORD = "..."              # Uni-Account Passwort
-UK_NUMMER = "uk123456"
-EWS_ENDPOINT = 'https://<mailserver>/EWS/Exchange.asmx'
-BOT_COMMAND_PREFIX = "!" 
-GOOGLE_FORM_LINK = "https://docs.google.com/forms/d/e/.../viewform?" # Teilen-Link, bis viewform?
-DEV_ENABLE_TOKEN_CACHE = 'false' # true / false. Bestimmt, ob das Token in einer unverschlüsselten Datei zwischengespeichert wird. 
-# Diese Option wird nur für Entwicklung benötigt, im laufenden Betrieb reicht es das Token im Arbeitsspeicher zu belassen und notfalls ein neues zu holen. 
+
+Nach dem Kopieren und sicheren Entpacken auf den vorgesehenen Linux-Host werden
+dessen erwarteter Kurzname und der berechtigte sudo-Login explizit gesetzt. Der
+im Bundle enthaltene Manager wird dann schrittweise ausgeführt:
+
+```sh
+export METHODENBOT_DEPLOY_HOST='<server-kurzname>'
+export METHODENBOT_DEPLOY_ADMIN='<sudo-login>'
+python3 deployment/manage.py plan
+sudo env METHODENBOT_DEPLOY_HOST="$METHODENBOT_DEPLOY_HOST" METHODENBOT_DEPLOY_ADMIN="$METHODENBOT_DEPLOY_ADMIN" \
+  python3 deployment/manage.py stage --confirm-data-transfer
+sudo env METHODENBOT_DEPLOY_HOST="$METHODENBOT_DEPLOY_HOST" METHODENBOT_DEPLOY_ADMIN="$METHODENBOT_DEPLOY_ADMIN" \
+  python3 deployment/manage.py live-preflight --confirm-data-transfer
+sudo env METHODENBOT_DEPLOY_HOST="$METHODENBOT_DEPLOY_HOST" METHODENBOT_DEPLOY_ADMIN="$METHODENBOT_DEPLOY_ADMIN" \
+  python3 deployment/manage.py activate --confirm-restart
 ```
-### Details about email filtering and processing
 
-- The script only checks for mails in the INBOX folder (Posteingang). 
-- It does not discern between read and unread mails (it is a group folder, so another person could have read the mail already)
-- Typo3 contact form emails are discerned from other mail traffic, using a few criteria such as
-    - X-Mailer Header used by Typo3
-    - All sorts of replies containing the orginal contact form are filtered out
-    - the mail body is scanned and expected to contain a few field names from the contact form
-    - The email message ID (unique across all emails) is used to recognize emails that have already been sent to RocketChat as messages. 
-        - To achieve this, the file `processed_emails.csv` is read if it exists. Otherwise it will be created later by the script. 
-- If an email is identified as Typo3 contact form, it is parsed. 
-    - The mail contains a HTML Table of the filled out Typo3 contact form. 
-    - This table is parsed into a python dict
-    - Some additional details, such as email subject, sender and date are parsed from other sources
-- A message is posted to the specified Matrix room, containing a few key fields from the dict. 
-    - The message is formatted using markdown. 
-- A second message with details is posted as a thread under the first message, in order to clean up the channel the remaining fields are posted as a thread message. 
-    - To achieve this, the event ID of the first message is retained and given as an argument to the thread posting function.
-- A third message with the pre-filled google-forms link is sent to the thread.
-- If posting was successful, a record of the processed email is created. The email is identified by its unique email message ID. This record is written to a `.csv` file named `processed_emails.csv`, which will be created in the same directory as the script. 
+`stage` verändert den laufenden Dienst nicht. `live-preflight` liest Matrix-Raum,
+Gateway-Modellliste und die letzten drei Exchange-Anfragen, sendet aber nichts.
+Erst `activate` stoppt den bestehenden Dienst kurz, legt ein rootgeschütztes
+Backup an, migriert CSVs und setzt das systemd-Drop-in. Ein Fehler während der
+Aktivierung stellt den vorherigen Einstieg nur dann automatisch wieder her, wenn
+Codepfad, Prozess und stabile PID anschließend verifiziert sind; andernfalls bleibt
+der Dienst absichtlich gestoppt und meldet den Restore-Fehler eindeutig. Der
+ausgegebene Backupname kann zusätzlich nur in der dazu passenden aktiven Release-Linie
+für `rollback --backup NAME --confirm-restart` verwendet werden. Folgereleases
+bewahren die kanonische `runtime.env`, den lokalen Token, CSVs und den KI-Schalter.
 
-### Flow
+## Tests
 
-1. Startup: Connect to Accounts
-1. Read CSV file of processed emails and create one if it does not exist.
-1. Fetch 100 newest emails from INBOX
-1. Clean up the CSV file - remove email IDs that are no longer in INBOX.
-1. Process all emails from INBOX, unless their ID is already in the CSV file
-1. Start a 'streaming subscription' to get notifications for new emails.
-1. Listen and wait for notifications
-1. In case an email arrives, process it and listen for more notifications.
-1. Renew the subscription after 30 minutes (maximum allowed connection time by EWS). 
+Offline, ohne Netzwerk:
 
-### Efficiency concerns
+```sh
+/home/methodenbot/methodenbot/venv/bin/python -B -m unittest discover -s tests -v
+/home/methodenbot/methodenbot/venv/bin/python -m pip check
+```
 
-The script does try to minimize resource usage. For example, by using the streaming notification system, only new emails are fetched. `exchangelib` offers `item_sync`, which does work fine but not for this use case, as we need the `headers` field to stay intact - and as it turns out, it is silently removed by the sync functionality. So this implementation relies on classic `fetch` instead of syncing, which was made more efficient by:
+Abgedeckt sind unter anderem Parserkompatibilität, KI-Redaktion und -Pacing,
+exakte Befehlsautorisierung, Erststart ohne History-Replay, Toggle-Reihenfolge,
+falsche/unsichere Räume, Zielräume für `Test`/`Test 2`, KI-aus ohne Modellaufruf,
+Matrix-401-Reauthentifizierung samt persistiertem Token, echte Zustandsneustarts,
+Crash-Idempotenz, begrenzte Zustellfehler, globale Mailauswahl und fail-closed CSV-Zustand.
 
-- only fetching the new email
-- only fetching select fields which are necessary, and not getting attachments for example. 
+## Noch nicht durch Offline-Tests bewiesen
 
-### Known Shortcomings
+Offline-Tests beweisen keinen erfolgreichen Zugriff auf Exchange, Matrix oder das
+lokale GWDG-Gateway. Vor produktiver Aktivierung sind deshalb erforderlich:
 
-- Credentials are stored in clear text in a config file and as environment variables. Which is ok, but not totally secure. 
-- If the contact form field names are updated, the script has to be updated as well. Otherwise it breaks and the contact form is not transported correctly. If you were eager, you could implement a fallback for this, which automatically posts the whole email to RocketChat and does not discern between field names. 
-
-### Matrix Bot Details
-
-In `matrixbot.py` wird eine Klasse erstellt, die sich per Username und Passwort bei der Matrix Client-Server API anmelden kann und das dabei erhaltene AccessToken lokal speichert. Diese Implementierung ist rudimentär und greift weder auf `async` Prinzipien noch auf kryptografische Verschlüsselung des Caches für AccessTokens zurück. Das erlauben wir uns hier, da der Server nicht von außen zugänglich ist. Eine Implementierung mittels existierender Clients wie `matrix-nio` oder darauf aufbauenden Client-Bibliotheken war zu kompliziert / mit zu viel Overhead verbunden dafür, einzig nur den Send-Message Endpoint der API nutzen zu wollen. Nichtsdestotrotz, besser geht es natürlich immer. 
-
-
-
+1. serverseitiger Konfigurations- und Berechtigungs-Preflight;
+2. Dienststart mit KI-Schalter aus;
+3. eine frische private Nachricht `Test` und Kontrolle, dass CSV/Statistik
+   unverändert bleiben;
+4. `KI an`, privater `Test`, anschließend optional `KI aus`;
+5. `Test 2` nur als bewusster letzter Produktionstest.

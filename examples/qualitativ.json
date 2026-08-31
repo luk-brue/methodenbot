@@ -1,0 +1,14 @@
+{
+  "request": {
+    "beschreibung": "In meiner qualitativen Studie möchte ich zwölf Interviews mit einer qualitativen Inhaltsanalyse auswerten. Ich arbeite mit MAXQDA.",
+    "fragen": "Beim Aufbau des Kategoriensystems fällt mir die Abgrenzung ähnlicher Codes schwer. Wie lässt sich die Codierung nachvollziehbar dokumentieren?"
+  },
+  "fixture_response": {
+    "kurzfassung": "Hilfe bei der Abgrenzung ähnlicher Codes und bei der nachvollziehbaren Dokumentation der Codierung gesucht. Die Interviews sollen mit qualitativer Inhaltsanalyse in MAXQDA ausgewertet werden.",
+    "analyseart": {"wert": "qualitativ", "status": "genannt", "beleg": "qualitativen Studie"},
+    "analyseschritt": {"wert": "Kategoriensystem, Codierung und Dokumentation", "status": "genannt", "beleg": "Aufbau des Kategoriensystems"},
+    "software": {"wert": "MAXQDA", "status": "genannt", "beleg": "Ich arbeite mit MAXQDA"},
+    "statistisches_modell": {"wert": "", "status": "nicht_angegeben", "beleg": ""},
+    "offene_punkte": []
+  }
+}
