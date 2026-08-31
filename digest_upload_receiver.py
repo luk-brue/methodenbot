@@ -9,10 +9,10 @@ import stat
 import sys
 import uuid
 
+from digest_bundle import DigestBundleError, MAX_BUNDLE_BYTES, unpack_bundle
 
-MAX_DIGEST_BYTES = 1_000_000
 COMMAND = re.compile(
-    r'digest-upload (\d{4}-\d{2}-\d{2}-methoden-digest\.md) ([0-9a-f]{64})')
+    r'digest-upload-v2 (\d{4}-\d{2}-\d{2}) ([0-9a-f]{64})')
 
 
 def fail(code):
@@ -33,16 +33,16 @@ def main():
     if (not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700
             or metadata.st_uid != os.geteuid()):
         return fail('unsafe_digest_inbox')
-    raw = sys.stdin.buffer.read(MAX_DIGEST_BYTES + 1)
-    if not 0 < len(raw) <= MAX_DIGEST_BYTES:
+    raw = sys.stdin.buffer.read(MAX_BUNDLE_BYTES + 1)
+    if not 0 < len(raw) <= MAX_BUNDLE_BYTES:
         return fail('invalid_digest_upload_size')
     try:
-        text = raw.decode('utf-8')
-    except UnicodeError:
-        return fail('digest_not_utf8')
-    if not text.strip() or hashlib.sha256(raw).hexdigest() != match.group(2):
+        unpack_bundle(raw)
+    except DigestBundleError:
+        return fail('invalid_digest_bundle')
+    if hashlib.sha256(raw).hexdigest() != match.group(2):
         return fail('digest_upload_hash_mismatch')
-    target = target_directory / match.group(1)
+    target = target_directory / (match.group(1) + '-methoden-digest.bundle')
     temporary = target_directory / ('.upload.' + uuid.uuid4().hex)
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)

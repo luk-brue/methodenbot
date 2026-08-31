@@ -14,14 +14,18 @@ import unicodedata
 import uuid
 from urllib.parse import urlsplit
 
+from digest_bundle import (DigestBundleError, MAX_BUNDLE_BYTES, MAX_MARKDOWN_BYTES,
+                           MAX_RIS_BYTES, unpack_bundle, validate_markdown, validate_ris)
 from digest_state import DigestStateError, MAX_DELIVERY_FAILURES
 from matrixbot import MAX_EVENT_CONTENT_BYTES, MatrixError, matrix_message_content
 
 
 logger = logging.getLogger(__name__)
 COMMANDS = {'Digest', 'Digest aus'}
-MAX_DIGEST_BYTES = 1_000_000
-DIGEST_NAME = re.compile(r'(\d{4}-\d{2}-\d{2})-methoden-digest\.md')
+DIGEST_BUNDLE_NAME = re.compile(r'(\d{4}-\d{2}-\d{2})-methoden-digest\.bundle')
+PAIRED_CONTENT_NAME = re.compile(
+    r'(\d{4}-\d{2}-\d{2})-([0-9a-f]{64})-([0-9a-f]{64})\.md')
+REGULAR_NEWSLETTER = re.compile(r'\A# Methoden-Journal-Digest(?:\s|–|-)')
 INLINE_MARKDOWN = re.compile(
     r'`([^`\n]+)`|\[([^\]\n]+)\]\(([^)\s]+)\)|\*\*([^*\n]+)\*\*|(?<!\*)\*([^*\n]+)\*(?!\*)')
 HEADING = re.compile(r'^(#{1,6})[ \t]+(.+?)\s*$')
@@ -219,31 +223,55 @@ def split_markdown(text):
             best = boundary + 1
         parts.append(remaining[:best])
         remaining = remaining[best:]
-    if ''.join(parts) != text or len(parts) > 100:
+    if ''.join(parts) != text or len(parts) > 99:
         raise DigestServiceError('digest_split_failed')
     return parts
 
 
-def _read_digest(path):
+def _read_private(path, limit):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, 'rb') as handle:
             metadata = os.fstat(handle.fileno())
             if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
                     or stat.S_IMODE(metadata.st_mode) != 0o600
-                    or not 0 < metadata.st_size <= MAX_DIGEST_BYTES):
+                    or not 0 < metadata.st_size <= limit):
                 raise DigestServiceError('unsafe_digest_file')
-            raw = handle.read(MAX_DIGEST_BYTES + 1)
-        if len(raw) > MAX_DIGEST_BYTES:
+            raw = handle.read(limit + 1)
+        if len(raw) > limit:
             raise DigestServiceError('digest_too_large')
-        text = raw.decode('utf-8')
     except DigestServiceError:
         raise
-    except (OSError, UnicodeError):
+    except OSError:
         raise DigestServiceError('digest_file_unreadable') from None
-    if not text.strip():
-        raise DigestServiceError('empty_digest')
+    return raw
+
+
+def _read_digest(path):
+    raw = _read_private(path, MAX_MARKDOWN_BYTES)
+    try:
+        text = validate_markdown(raw)
+    except DigestBundleError as exc:
+        raise DigestServiceError(str(exc)) from None
     return raw, text
+
+
+def _read_ris(path):
+    raw = _read_private(path, MAX_RIS_BYTES)
+    try:
+        text = validate_ris(raw)
+    except DigestBundleError as exc:
+        raise DigestServiceError(str(exc)) from None
+    return raw, text
+
+
+def _read_bundle(path):
+    raw = _read_private(path, MAX_BUNDLE_BYTES)
+    try:
+        markdown, ris = unpack_bundle(raw)
+    except DigestBundleError as exc:
+        raise DigestServiceError(str(exc)) from None
+    return raw, markdown, ris
 
 
 def _atomic_private_write(directory, name, raw):
@@ -254,7 +282,7 @@ def _atomic_private_write(directory, name, raw):
         raise DigestServiceError('unsafe_digest_content_directory')
     target = directory / name
     if target.exists():
-        existing, _text = _read_digest(target)
+        existing = _read_private(target, max(MAX_MARKDOWN_BYTES, MAX_RIS_BYTES))
         if existing != raw:
             raise DigestServiceError('digest_content_conflict')
         return target
@@ -372,6 +400,75 @@ class DigestService:
                          or content.get('formatted_body') != formatted))):
             raise MatrixError('matrix_readback_mismatch')
 
+    def _verify_file(self, room_id, event_id, content_uri, filename, size):
+        event = self.bot.read_event(room_id, event_id)
+        content = event.get('content', {}) if isinstance(event, dict) else {}
+        expected = {
+            'msgtype': 'm.file', 'body': filename, 'filename': filename,
+            'url': content_uri,
+            'info': {'mimetype': 'application/x-research-info-systems', 'size': size},
+        }
+        if (event.get('event_id', event_id) != event_id
+                or event.get('type') != 'm.room.message'
+                or event.get('sender') != self.bot.user_id
+                or content != expected):
+            raise MatrixError('matrix_file_readback_mismatch')
+
+    def _digest_resources(self, digest):
+        path = self.state.content_directory / digest['content_file']
+        raw, text = _read_digest(path)
+        if hashlib.sha256(raw).hexdigest() != digest['sha256']:
+            raise DigestServiceError('digest_content_hash_mismatch')
+        match = PAIRED_CONTENT_NAME.fullmatch(digest['content_file'])
+        if match is None:
+            return split_markdown(text), text, None, None
+        if match.group(2) != digest['sha256']:
+            raise DigestServiceError('digest_content_hash_mismatch')
+        ris_path = path.with_suffix('.ris')
+        ris_raw, _ris_text = _read_ris(ris_path)
+        if hashlib.sha256(ris_raw).hexdigest() != match.group(3):
+            raise DigestServiceError('digest_ris_hash_mismatch')
+        return (split_markdown(text), text, ris_raw,
+                match.group(1) + '-methoden-artikel.ris')
+
+    def _ensure_ris_media(self, date, digest, ris_raw, ris_name):
+        if ris_raw is None or ris_name is None:
+            raise DigestServiceError('digest_ris_unavailable')
+        content_uri = digest['ris_mxc']
+        if content_uri is None:
+            content_uri = self.bot.create_media_uri()
+            self.state.record_digest_media(date, content_uri)
+            digest = self.state.snapshot()['digests'][date]
+        if not digest['ris_uploaded']:
+            self.bot.upload_media(content_uri, ris_raw, ris_name)
+            self.state.mark_digest_media_uploaded(date, content_uri)
+        return content_uri
+
+    def _latest_newsletter(self):
+        snapshot = self.state.snapshot()
+        for date in sorted(snapshot['digests'], reverse=True):
+            digest = snapshot['digests'][date]
+            parts, text, ris_raw, ris_name = self._digest_resources(digest)
+            if ris_raw is not None and REGULAR_NEWSLETTER.match(text):
+                return date, digest, parts, ris_raw, ris_name
+        return None
+
+    def _send_welcome_newsletter(self, room_id, event_id, latest):
+        date, digest, parts, ris_raw, ris_name = latest
+        content_uri = self._ensure_ris_media(date, digest, ris_raw, ris_name)
+        transaction_root = 'digest-welcome-' + _transaction(event_id)[:36]
+        for index, text in enumerate(parts):
+            formatted = markdown_to_matrix_html(text)
+            sent = self.bot.send_message(
+                text, room_id=room_id, html_msg=formatted,
+                transaction_id=transaction_root + '-m' + str(index + 1))
+            self._verify_text(room_id, sent, text, formatted)
+        sent = self.bot.send_file(
+            content_uri, ris_name, len(ris_raw), room_id=room_id,
+            transaction_id=transaction_root + '-ris')
+        self._verify_file(room_id, sent, content_uri, ris_name, len(ris_raw))
+        return True
+
     def _process_command(self, room_id, event_id, user_id, command):
         if self.state.command_completed(event_id):
             return
@@ -383,15 +480,21 @@ class DigestService:
             self.state.ignore_command(event_id)
             return
         if command == 'Digest aus':
+            latest = None
             message = ('Digest deaktiviert. Du erhältst in diesem Raum keine weiteren '
                        'wöchentlichen Methoden-Journal-Digests.')
         else:
+            latest = self._latest_newsletter()
             message = ('Digest aktiviert. Du erhältst künftig den wöchentlichen '
                        'Methoden-Journal-Digest in diesem privaten Raum. Mit „Digest aus“ '
-                       'kannst du ihn wieder abbestellen.')
+                       'kannst du ihn wieder abbestellen. '
+                       + ('Die letzte verfügbare Ausgabe folgt sofort.' if latest is not None
+                          else 'Sobald eine Ausgabe verfügbar ist, wird sie hier zugestellt.'))
         transaction = 'digest-command-' + _transaction(event_id)[:40]
         sent = self.bot.send_message(message, room_id=room_id, transaction_id=transaction)
         self._verify_text(room_id, sent, message)
+        if latest is not None:
+            self._send_welcome_newsletter(room_id, event_id, latest)
         self.state.apply_command(event_id, command, user_id, room_id)
 
     def poll_once(self, *, timeout_ms=30_000):
@@ -419,24 +522,29 @@ class DigestService:
                 or metadata.st_uid != os.geteuid()):
             raise DigestServiceError('unsafe_digest_inbox')
         for path in sorted(self.inbox.iterdir()):
-            match = DIGEST_NAME.fullmatch(path.name)
+            match = DIGEST_BUNDLE_NAME.fullmatch(path.name)
             if match is None:
                 continue
             try:
                 Date.fromisoformat(match.group(1))
             except ValueError:
                 raise DigestServiceError('invalid_digest_date') from None
-            raw, text = _read_digest(path)
-            digest_hash = hashlib.sha256(raw).hexdigest()
-            content_name = match.group(1) + '-' + digest_hash + '.md'
-            target = _atomic_private_write(self.state.content_directory, content_name, raw)
+            bundle_raw, markdown_raw, ris_raw = _read_bundle(path)
+            digest_hash = hashlib.sha256(markdown_raw).hexdigest()
+            ris_hash = hashlib.sha256(ris_raw).hexdigest()
+            content_stem = match.group(1) + '-' + digest_hash + '-' + ris_hash
+            content_name = content_stem + '.md'
+            target = _atomic_private_write(
+                self.state.content_directory, content_name, markdown_raw)
+            _atomic_private_write(self.state.content_directory, content_stem + '.ris', ris_raw)
+            _raw, text = _read_digest(target)
             parts = split_markdown(text)
-            self.state.stage_digest(match.group(1), digest_hash, target.name, len(parts))
+            self.state.stage_digest(match.group(1), digest_hash, target.name, len(parts) + 1)
             # The protected content copy and delivery plan are durable. Remove
             # the one-shot inbox entry so old weeks cannot be restaged after
             # bounded state-history pruning.
-            check_raw, _check_text = _read_digest(path)
-            if hashlib.sha256(check_raw).hexdigest() != digest_hash:
+            check_raw, _check_markdown, _check_ris = _read_bundle(path)
+            if hashlib.sha256(check_raw).hexdigest() != hashlib.sha256(bundle_raw).hexdigest():
                 raise DigestServiceError('digest_inbox_changed_during_stage')
             path.unlink()
             inbox_fd = os.open(self.inbox, os.O_RDONLY | os.O_DIRECTORY)
@@ -446,20 +554,19 @@ class DigestService:
                 os.close(inbox_fd)
         self.state.finish_empty_digests()
 
-    def _content_parts(self, digest):
-        path = self.state.content_directory / digest['content_file']
-        raw, text = _read_digest(path)
-        if hashlib.sha256(raw).hexdigest() != digest['sha256']:
-            raise DigestServiceError('digest_content_hash_mismatch')
-        return split_markdown(text)
-
     def _deliver(self):
         snapshot = self.state.snapshot()
         for date in sorted(snapshot['digests']):
             digest = snapshot['digests'][date]
             if digest['status'] != 'pending':
                 continue
-            parts = self._content_parts(digest)
+            parts, _text, ris_raw, ris_name = self._digest_resources(digest)
+            expected_parts = len(parts) + (1 if ris_raw is not None else 0)
+            if any(len(recipient['parts']) != expected_parts
+                   for recipient in digest['recipients'].values()):
+                raise DigestServiceError('digest_delivery_plan_mismatch')
+            content_uri = (self._ensure_ris_media(date, digest, ris_raw, ris_name)
+                           if ris_raw is not None else None)
             for user_id, recipient in digest['recipients'].items():
                 if recipient['status'] != 'pending':
                     continue
@@ -482,6 +589,20 @@ class DigestService:
                                 text, room_id=recipient['room_id'], html_msg=formatted,
                                 transaction_id=transaction)
                         self._verify_text(recipient['room_id'], event_id, text, formatted)
+                        self.state.record_part(date, user_id, index, event_id)
+                        recipient['parts'][index] = event_id
+                    if ris_raw is not None:
+                        index = len(parts)
+                        event_id = recipient['parts'][index]
+                        transaction = ('digest-' + date.replace('-', '') + '-'
+                                       + digest['sha256'][:12] + '-'
+                                       + _transaction(user_id)[:12] + '-ris')
+                        if event_id is None:
+                            event_id = self.bot.send_file(
+                                content_uri, ris_name, len(ris_raw),
+                                room_id=recipient['room_id'], transaction_id=transaction)
+                        self._verify_file(recipient['room_id'], event_id, content_uri,
+                                          ris_name, len(ris_raw))
                         self.state.record_part(date, user_id, index, event_id)
                         recipient['parts'][index] = event_id
                     self.state.finish_recipient(date, user_id, 'delivered')

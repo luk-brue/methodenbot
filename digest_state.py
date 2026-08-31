@@ -34,6 +34,11 @@ def _matrix_event(value):
     return isinstance(value, str) and value.startswith('$') and len(value) <= 1024
 
 
+def _matrix_media(value):
+    return (isinstance(value, str)
+            and re.fullmatch(r'mxc://[A-Za-z0-9._:-]+/[A-Za-z0-9_-]+', value) is not None)
+
+
 class DigestState:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -42,14 +47,19 @@ class DigestState:
         self.content_directory = self.directory / 'content'
         self._mutex = threading.RLock()
         self._process_lock = None
-        self._default = {'version': 1, 'since': None, 'subscriptions': {},
+        self._default = {'version': 2, 'since': None, 'subscriptions': {},
                          'completed_commands': [], 'digests': {}}
         self._prepare_directory(self.directory)
         self._prepare_directory(self.content_directory)
         with self._mutex:
             try:
                 os.lstat(self.path)
-                self._read()
+                data = self._read()
+                if data['version'] == 1:
+                    data['version'] = 2
+                    for digest in data['digests'].values():
+                        digest.update(ris_mxc=None, ris_uploaded=False)
+                    self._write(data)
             except FileNotFoundError:
                 self._write(copy.deepcopy(self._default))
 
@@ -86,7 +96,7 @@ class DigestState:
         if (not isinstance(data, dict)
                 or set(data) != {'version', 'since', 'subscriptions',
                                  'completed_commands', 'digests'}
-                or data.get('version') != 1
+                or data.get('version') not in (1, 2)
                 or data.get('since') is not None and not isinstance(data.get('since'), str)
                 or not isinstance(data.get('subscriptions'), dict)
                 or len(data['subscriptions']) > MAX_SUBSCRIPTIONS
@@ -104,9 +114,13 @@ class DigestState:
                     or not _matrix_event(subscription.get('event_id'))):
                 raise DigestStateError('invalid_digest_subscription')
         for date, digest in data['digests'].items():
+            expected = ({'sha256', 'content_file', 'status', 'recipients'}
+                        if data['version'] == 1 else
+                        {'sha256', 'content_file', 'status', 'recipients',
+                         'ris_mxc', 'ris_uploaded'})
             if (not isinstance(date, str) or re.fullmatch(r'\d{4}-\d{2}-\d{2}', date) is None
                     or not isinstance(digest, dict)
-                    or set(digest) != {'sha256', 'content_file', 'status', 'recipients'}
+                    or set(digest) != expected
                     or not isinstance(digest.get('sha256'), str)
                     or re.fullmatch(r'[0-9a-f]{64}', digest['sha256']) is None
                     or not isinstance(digest.get('content_file'), str)
@@ -114,6 +128,11 @@ class DigestState:
                     or digest.get('status') not in ('pending', 'complete')
                     or not isinstance(digest.get('recipients'), dict)
                     or len(digest['recipients']) > MAX_SUBSCRIPTIONS):
+                raise DigestStateError('invalid_digest_record')
+            if (data['version'] == 2
+                    and (digest['ris_mxc'] is not None and not _matrix_media(digest['ris_mxc'])
+                         or type(digest['ris_uploaded']) is not bool
+                         or digest['ris_uploaded'] and digest['ris_mxc'] is None)):
                 raise DigestStateError('invalid_digest_record')
             for user_id, recipient in digest['recipients'].items():
                 if (not _matrix_user(user_id) or not isinstance(recipient, dict)
@@ -249,7 +268,8 @@ class DigestState:
                 for user_id, value in data['subscriptions'].items()
             }
             data['digests'][date] = {'sha256': sha256, 'content_file': content_file,
-                                     'status': 'pending', 'recipients': recipients}
+                                     'status': 'pending', 'recipients': recipients,
+                                     'ris_mxc': None, 'ris_uploaded': False}
             while len(data['digests']) > MAX_DIGESTS:
                 oldest = sorted(data['digests'])[0]
                 if data['digests'][oldest]['status'] != 'complete':
@@ -257,6 +277,28 @@ class DigestState:
                 del data['digests'][oldest]
             return True
         return self._change(update)[0]
+
+    def record_digest_media(self, date, mxc_uri):
+        if not _matrix_media(mxc_uri):
+            raise DigestStateError('invalid_digest_media')
+        def update(data):
+            digest = data['digests'][date]
+            current = digest['ris_mxc']
+            if current is not None and current != mxc_uri:
+                raise DigestStateError('digest_media_changed')
+            digest['ris_mxc'] = mxc_uri
+            return mxc_uri
+        return self._change(update)[0]
+
+    def mark_digest_media_uploaded(self, date, mxc_uri):
+        if not _matrix_media(mxc_uri):
+            raise DigestStateError('invalid_digest_media')
+        def update(data):
+            digest = data['digests'][date]
+            if digest['ris_mxc'] != mxc_uri:
+                raise DigestStateError('digest_media_changed')
+            digest['ris_uploaded'] = True
+        self._change(update)
 
     def record_part(self, date, user_id, index, event_id):
         if not _matrix_event(event_id):

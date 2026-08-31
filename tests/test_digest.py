@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from digest_bundle import DigestBundleError, pack_bundle, unpack_bundle
 from digest_service import (DigestService, DigestServiceError, digest_command_from_event,
                             markdown_to_matrix_html, split_markdown)
 from digest_state import DigestState, DigestStateError
@@ -57,6 +59,8 @@ class FakeBot:
         self.events = {}
         self.transactions = {}
         self.send_attempts = []
+        self.file_attempts = []
+        self.media_uploads = []
 
     def sync(self, **_kwargs):
         return copy.deepcopy(self.sync_responses.pop(0))
@@ -80,6 +84,28 @@ class FakeBot:
         self.events[room_id, event_id] = {
             'event_id': event_id, 'type': 'm.room.message', 'sender': BOT,
             'content': content}
+        return event_id
+
+    def create_media_uri(self):
+        return 'mxc://example.org/ris' + str(len(self.media_uploads) + 1)
+
+    def upload_media(self, content_uri, raw, filename, **_kwargs):
+        self.media_uploads.append((content_uri, raw, filename))
+        return content_uri
+
+    def send_file(self, content_uri, filename, size, room_id=None, transaction_id=None):
+        self.file_attempts.append((room_id, transaction_id, content_uri, filename, size))
+        if transaction_id in self.transactions:
+            return self.transactions[transaction_id]
+        event_id = '$sent-' + str(len(self.transactions) + 1)
+        self.transactions[transaction_id] = event_id
+        self.events[room_id, event_id] = {
+            'event_id': event_id, 'type': 'm.room.message', 'sender': BOT,
+            'content': {
+                'msgtype': 'm.file', 'body': filename, 'filename': filename,
+                'url': content_uri,
+                'info': {'mimetype': 'application/x-research-info-systems', 'size': size},
+            }}
         return event_id
 
     def read_event(self, room_id, event_id):
@@ -136,6 +162,44 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(self.state.snapshot()['subscriptions'][USER]['room_id'], ROOM)
         self.assertIn('Digest aktiviert', self.bot.send_attempts[-1][2])
 
+    def test_digest_command_immediately_sends_latest_newsletter_and_ris(self):
+        inbox = Path(self.config.digest_inbox_dir)
+        inbox.mkdir(mode=0o700)
+        markdown = b'# Methoden-Journal-Digest \xe2\x80\x93 28. August 2026\n\n**Kurzfazit**\n'
+        ris = b'TY  - JOUR\nTI  - Beispiel\nER  -\n'
+        source = inbox / '2026-08-28-methoden-digest.bundle'
+        source.write_bytes(pack_bundle(markdown, ris))
+        source.chmod(0o600)
+        self.service.process_inbox()
+        self.assertEqual(self.bot.send_attempts, [])
+        self.state.bootstrap('s0')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {'events': [event('$subscribe-now', 'Digest')]}}}}}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.state.snapshot()['subscriptions'][USER]['room_id'], ROOM)
+        self.assertEqual(len(self.bot.send_attempts), 2)
+        self.assertIn('Digest aktiviert', self.bot.send_attempts[0][2])
+        self.assertEqual(self.bot.send_attempts[1][2], markdown.decode())
+        self.assertEqual(len(self.bot.file_attempts), 1)
+        self.assertEqual(self.bot.file_attempts[0][3], '2026-08-28-methoden-artikel.ris')
+        self.assertEqual(self.bot.media_uploads[0][1], ris)
+
+    def test_non_newsletter_digest_is_not_used_for_immediate_delivery(self):
+        inbox = Path(self.config.digest_inbox_dir)
+        inbox.mkdir(mode=0o700)
+        source = inbox / '2026-08-31-methoden-digest.bundle'
+        source.write_bytes(pack_bundle(
+            b'# Formatierungstest des Methoden-Digests\n',
+            b'TY  - JOUR\nTI  - Test\nER  -\n'))
+        source.chmod(0o600)
+        self.service.process_inbox()
+        self.state.bootstrap('s0')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {'events': [event('$subscribe-test', 'Digest')]}}}}}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(len(self.bot.send_attempts), 1)
+        self.assertEqual(self.bot.file_attempts, [])
+
     def test_encrypted_invite_is_not_joined(self):
         self.state.bootstrap('s0')
         invited = '!encrypted:example.org'
@@ -184,8 +248,9 @@ class DigestTests(unittest.TestCase):
         inbox = Path(self.config.digest_inbox_dir)
         inbox.mkdir(mode=0o700)
         markdown = '# Wochenüberblick\n\nEine geprüfte Zusammenfassung.\n'
-        source = inbox / '2026-08-28-methoden-digest.md'
-        source.write_text(markdown, encoding='utf-8')
+        ris = 'TY  - JOUR\nTI  - Beispiel\nER  -\n'
+        source = inbox / '2026-08-28-methoden-digest.bundle'
+        source.write_bytes(pack_bundle(markdown.encode(), ris.encode()))
         source.chmod(0o600)
         self.service.process_inbox()
         first_count = len(self.bot.send_attempts)
@@ -199,6 +264,9 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(''.join(value[2] for value in self.bot.send_attempts), markdown)
         self.assertEqual(self.bot.send_attempts[0][3],
                          '<h1>Wochenüberblick</h1><p>Eine geprüfte Zusammenfassung.</p>')
+        self.assertEqual(len(self.bot.file_attempts), 1)
+        self.assertEqual(self.bot.file_attempts[0][3], '2026-08-28-methoden-artikel.ris')
+        self.assertEqual(self.bot.media_uploads[0][1], ris.encode())
 
     def test_markdown_html_formats_digest_and_escapes_source(self):
         markdown = ('# Titel & Befund\n\n**Berichtszeitraum:** 22.–28. August  \n'
@@ -219,11 +287,12 @@ class DigestTests(unittest.TestCase):
     def test_same_date_with_changed_content_stops_fail_closed(self):
         inbox = Path(self.config.digest_inbox_dir)
         inbox.mkdir(mode=0o700)
-        source = inbox / '2026-08-28-methoden-digest.md'
-        source.write_text('first\n')
+        source = inbox / '2026-08-28-methoden-digest.bundle'
+        ris = b'TY  - JOUR\nTI  - Beispiel\nER  -\n'
+        source.write_bytes(pack_bundle(b'first\n', ris))
         source.chmod(0o600)
         self.service.process_inbox()
-        source.write_text('changed\n')
+        source.write_bytes(pack_bundle(b'changed\n', ris))
         source.chmod(0o600)
         with self.assertRaisesRegex(DigestStateError, 'digest_date_hash_conflict'):
             self.service.process_inbox()
@@ -239,29 +308,57 @@ class DigestTests(unittest.TestCase):
     def test_restricted_receiver_checks_hash_and_writes_private_file(self):
         inbox = Path(self.directory.name) / 'upload'
         inbox.mkdir(mode=0o700)
-        raw = b'# Digest\n'
+        raw = pack_bundle(b'# Digest\n', b'TY  - JOUR\nTI  - Beispiel\nER  -\n')
         digest = hashlib.sha256(raw).hexdigest()
-        command = 'digest-upload 2026-08-28-methoden-digest.md ' + digest
+        command = 'digest-upload-v2 2026-08-28 ' + digest
         with (patch.dict(os.environ, {'SSH_ORIGINAL_COMMAND': command,
                                       'METHODENBOT_DIGEST_INBOX': str(inbox)}, clear=False),
               patch.object(digest_upload_receiver.sys, 'stdin', Stdin(raw))):
             self.assertEqual(digest_upload_receiver.main(), 0)
-        target = inbox / '2026-08-28-methoden-digest.md'
+        target = inbox / '2026-08-28-methoden-digest.bundle'
         self.assertEqual(target.read_bytes(), raw)
         self.assertEqual(target.stat().st_mode & 0o777, 0o600)
 
     def test_uploader_requires_exact_remote_receipt(self):
         source = Path(self.directory.name) / '2026-08-28-methoden-digest.md'
         source.write_bytes(b'# Digest\n')
-        digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        expected = ('digest_upload_ok ' + source.name + ' ' + digest + '\n').encode()
+        ris = Path(self.directory.name) / '2026-08-28-methoden-artikel.ris'
+        ris.write_bytes(b'TY  - JOUR\nTI  - Beispiel\nER  -\n')
+        bundle = pack_bundle(source.read_bytes(), ris.read_bytes())
+        digest = hashlib.sha256(bundle).hexdigest()
+        expected = ('digest_upload_ok 2026-08-28 ' + digest + '\n').encode()
         completed = SimpleNamespace(returncode=0, stdout=expected, stderr=b'')
         with patch.object(digest_upload.subprocess, 'run', return_value=completed) as run:
-            self.assertEqual(digest_upload.upload(source, 'methodenbot-digest-upload'), digest)
+            self.assertEqual(digest_upload.upload(
+                source, ris, 'methodenbot-digest-upload'), digest)
         self.assertEqual(run.call_args.args[0][0:5],
                          ['/usr/bin/ssh', '-T', '-o', 'BatchMode=yes',
                           'methodenbot-digest-upload'])
-        self.assertEqual(run.call_args.kwargs['input'], source.read_bytes())
+        self.assertEqual(run.call_args.kwargs['input'], bundle)
+
+    def test_bundle_requires_valid_ris_records(self):
+        with self.assertRaises(DigestBundleError):
+            pack_bundle(b'# Digest\n', b'not ris\n')
+        markdown, ris = unpack_bundle(pack_bundle(
+            b'# Digest\n', b'TY  - JOUR\nTI  - Beispiel\nER  -\n'))
+        self.assertEqual(markdown, b'# Digest\n')
+        self.assertIn(b'TY  - JOUR', ris)
+
+    def test_version_one_state_is_migrated_without_changing_deliveries(self):
+        root = Path(self.directory.name) / 'legacy-state'
+        root.mkdir(mode=0o700)
+        legacy = {
+            'version': 1, 'since': 's0', 'subscriptions': {}, 'completed_commands': [],
+            'digests': {'2026-08-28': {
+                'sha256': 'a' * 64, 'content_file': '2026-08-28-' + 'a' * 64 + '.md',
+                'status': 'complete', 'recipients': {}}}}
+        path = root / 'state.json'
+        path.write_text(json.dumps(legacy) + '\n', encoding='utf-8')
+        path.chmod(0o600)
+        migrated = DigestState(root).snapshot()
+        self.assertEqual(migrated['version'], 2)
+        self.assertIsNone(migrated['digests']['2026-08-28']['ris_mxc'])
+        self.assertFalse(migrated['digests']['2026-08-28']['ris_uploaded'])
 
 
 if __name__ == '__main__':

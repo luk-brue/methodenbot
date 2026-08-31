@@ -85,9 +85,10 @@ zu werden. Änderungen erfolgen atomar und werden auf Datei und Verzeichnis sync
 
 Interessierte Personen eröffnen selbst einen privaten Raum mit dem Methodenbot und
 senden dort als reine Textnachricht exakt `Digest`. Der Bot nimmt neue prüfbare
-Raumeinladungen automatisch an und bestätigt anschließend das Abonnement. `Digest aus`
-beendet es wieder. Pro Matrix-Benutzer-ID ist genau ein Zielraum aktiv; ein neues
-`Digest` in einem anderen privaten Raum ersetzt den bisherigen Zielraum.
+Raumeinladungen automatisch an, bestätigt anschließend das Abonnement und sendet sofort
+die jüngste reguläre Ausgabe einschließlich der zugehörigen RIS-Datei. `Digest aus`
+beendet das Abonnement wieder. Pro Matrix-Benutzer-ID ist genau ein Zielraum aktiv; ein
+neues `Digest` in einem anderen privaten Raum ersetzt den bisherigen Zielraum.
 
 Vor der Anmeldung und vor jedem Wochenversand prüft der Bot, dass ausschließlich die
 abonnierende Person und der Bot Mitglieder sind, der Raum nur per Einladung zugänglich
@@ -100,25 +101,28 @@ Die geprüfte Datei gelangt nicht über Git oder die Exchange-Inbox in den Bot, 
 über einen eng begrenzten SSH-Upload:
 
 1. Die Freitags-Automation erzeugt und prüft lokal
-   `YYYY-MM-DD-methoden-digest.md`.
-2. `digest_upload.py` validiert Dateiname, Größe und UTF-8, berechnet SHA-256 und
-   überträgt die Bytes über einen dedizierten SSH-Config-Alias.
+   `YYYY-MM-DD-methoden-digest.md` und `YYYY-MM-DD-methoden-artikel.ris`.
+2. `digest_upload.py` validiert zusammengehörige Dateinamen, Größen, UTF-8 und die
+   RIS-Datensatzgrenzen, bildet ein längengeprüftes gemeinsames Bundle, berechnet
+   SHA-256 und überträgt die Bytes über einen dedizierten SSH-Config-Alias.
 3. Der öffentliche Schlüssel dieses Uploaders erhält serverseitig ausschließlich den
    erzwungenen Befehl `digest_upload_receiver.py`; Shell, PTY und Weiterleitungen
    bleiben durch die OpenSSH-Option `restrict` gesperrt.
-4. Der Receiver bestätigt nur eine atomar und mit passendem Hash unter
-   `/var/lib/methodenbot/digest/inbox/` gespeicherte Datei. Erst danach meldet der
+4. Der Receiver bestätigt nur ein atomar und mit passendem Hash unter
+   `/var/lib/methodenbot/digest/inbox/` gespeichertes Bundle. Erst danach meldet der
    lokale Uploader Erfolg.
-5. Der laufende Bot friert Inhalt, Empfängerliste und Hash geschützt ein und sendet
-   die Markdown-Datei nötigenfalls in unveränderten, größenbegrenzten Teilen. Stabile
-   Matrix-Transaktions-IDs und Readback verhindern Doppelversand nach einem Neustart.
+5. Der laufende Bot friert Inhalte, Empfängerliste und Hashes geschützt ein, sendet
+   Markdown als formatierte, größenbegrenzte Matrix-Nachrichten und RIS als
+   herunterladbare Datei. Stabile Matrix-Transaktions-IDs, persistente Medien-URIs und
+   Readback verhindern sichtbare Doppelzustellungen nach einem Neustart.
 
 Beispiel für den lokalen Aufruf nach erfolgreicher Digest-Prüfung:
 
 ```sh
 python3 digest_upload.py \
   --target methodenbot-digest-upload \
-  /Users/fscharf/Downloads/Methoden-Journal-Digest/YYYY-MM-DD-methoden-digest.md
+  /Users/fscharf/Downloads/Methoden-Journal-Digest/YYYY-MM-DD-methoden-digest.md \
+  /Users/fscharf/Downloads/Methoden-Journal-Digest/YYYY-MM-DD-methoden-artikel.ris
 ```
 
 Der SSH-Alias enthält Host, Benutzer und den Pfad zu einem eigenen Upload-Schlüssel;

@@ -60,7 +60,8 @@ Befehle bleiben ausführbar.
 - `matrixbot.py` – Matrix-Transport, stabile Sitzung, 401/429 und Transaktions-IDs
 - `digest_service.py` – private `Digest`-/`Digest aus`-Befehle und Wochenversand
 - `digest_state.py` – geschützte Abonnements und idempotente Zustellbelege
-- `digest_upload.py` / `digest_upload_receiver.py` – hashgeprüfte SSH-Übergabe
+- `digest_bundle.py` / `digest_upload.py` / `digest_upload_receiver.py` – atomare,
+  hashgeprüfte SSH-Übergabe von Markdown und RIS
 - `ai_service.py` – ausschließlich lokales Gateway und gemeinsamer Pacer
 - `ai_summary.py`, `summary_selection.py` – Minimierung, Auswahl und Darstellung
 - `form_table_compat.py` – kompatibler TH/TD- und TD/TD-Parser
