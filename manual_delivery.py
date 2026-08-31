@@ -108,7 +108,7 @@ def _part(msg, html_msg, room_id, thread_root_part, transaction_id):
 
 
 def build_test_plan(exchange, config, ai_service, *, command, command_event_id, ai_enabled):
-    """Freeze every message before the first Matrix side effect."""
+    """Freeze all test content before the first test-content Matrix side effect."""
     if command not in ('Test', 'Test 2'):
         raise ManualDeliveryError('invalid_test_command')
     count = 3 if command == 'Test' else 1
@@ -145,6 +145,24 @@ def build_test_plan(exchange, config, ai_service, *, command, command_event_id, 
     return parts
 
 
+def build_test_wait_ack(config, command_event_id, command, ai_enabled):
+    if command not in ('Test', 'Test 2'):
+        raise ManualDeliveryError('invalid_test_command')
+    if command == 'Test':
+        text = 'Test angenommen. Ich bereite die letzten drei Anfragen vor.'
+    else:
+        text = ('Test 2 angenommen. Ich bereite die letzte Anfrage für den Techniktest '
+                'im echten Zielkanal vor.')
+    if ai_enabled:
+        text += ' Mit eingeschalteter KI kann das mehrere Minuten dauern.'
+    else:
+        text += ' Die Ergebnisse folgen.'
+    text += ' Weitere Testbefehle werden anschließend bearbeitet.'
+    digest = hashlib.sha256(command_event_id.encode('utf-8')).hexdigest()[:40]
+    return _part(text, '<p>' + html.escape(text) + '</p>', config.matrix_console_room_id,
+                 None, 'control-' + digest + '-accepted')
+
+
 def build_toggle_ack(config, command_event_id, enabled):
     text = ('KI-Zusammenfassungen sind jetzt eingeschaltet.' if enabled
             else 'KI-Zusammenfassungen sind jetzt ausgeschaltet.')
@@ -155,7 +173,8 @@ def build_toggle_ack(config, command_event_id, enabled):
 def build_failure_ack(config, command_event_id, code):
     safe_codes = {
         'ai_unavailable': 'KI konnte nicht eingeschaltet werden; Freigabe oder lokaler Zugang fehlen.',
-        'test_failed': 'Der Test konnte vor dem Versand nicht vollständig vorbereitet werden. Es wurde nichts neu versendet.',
+        'test_failed': ('Der Test konnte vor dem Versand nicht vollständig vorbereitet werden. '
+                        'Es wurden keine Testinhalte versendet.'),
     }
     text = safe_codes.get(code, 'Der Befehl konnte sicher nicht ausgeführt werden.')
     return [_part(text, '<p>' + html.escape(text) + '</p>', config.matrix_console_room_id,

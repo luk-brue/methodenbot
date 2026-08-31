@@ -39,6 +39,10 @@ die neueste Anfrage mit dem sichtbaren Beginn `Techniktest` in den produktiven
 Zielraum. Beide Pfade sind read-only gegenüber Exchange, Processed-CSV und
 Statistik. `Test 2` ist trotzdem ein realer Matrix-Seiteneffekt.
 
+Beide Testbefehle werden sofort privat bestätigt, bevor Exchange und gegebenenfalls
+die KI arbeiten. Bei eingeschalteter KI nennt die Bestätigung die mögliche Wartezeit;
+weitere Testbefehle werden seriell nach dem laufenden Test bearbeitet.
+
 Alte Chatnachrichten werden beim ersten Start nicht ausgeführt. Kontrollbefehle
 werden mit Cursor, Journal, stabilen Transaktions-IDs, persistenter Matrix-Sitzung
 und Event-Readback gegen Crash-Duplikate geschützt. Die KI-Einstellung ist global,

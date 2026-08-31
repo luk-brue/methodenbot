@@ -11,7 +11,8 @@ from ai_service import AISummaryService
 from ai_summary import AISettings
 from ai_summary import SummaryUnavailable
 from control_state import ControlState, ControlStateError
-from manual_delivery import ManualDeliveryError, build_test_plan, select_latest_requests
+from manual_delivery import (ManualDeliveryError, build_failure_ack, build_test_plan,
+                             build_test_wait_ack, select_latest_requests)
 from matrix_commands import (ControlSecurityError, MatrixCommandListener,
                              command_from_event, validate_control_room)
 from matrixbot import MatrixError
@@ -220,6 +221,96 @@ class FinalControlTests(unittest.TestCase):
         transaction = 'control-' + hashlib.sha256(b'$on').hexdigest()[:40] + '-0'
         notice = self.bot.events[CONTROL, self.bot.transaction_events[transaction]]['content']['body']
         self.assertIn('nicht eingeschaltet', notice)
+        self.assertEqual(self.bot.send_attempts[-1], transaction)
+        self.assertFalse(any(value.endswith('-accepted') for value in self.bot.send_attempts))
+
+    def test_test_ack_is_confirmed_before_slow_planning(self):
+        self.state.bootstrap('s0')
+        self.state.record_sync('s1', [('$slow', 'Test')])
+        digest = hashlib.sha256(b'$slow').hexdigest()[:40]
+        accepted_transaction = 'control-' + digest + '-accepted'
+
+        def account_factory():
+            self.assertIn(accepted_transaction, self.bot.transaction_events)
+            return exchange_with()
+
+        def plan(_exchange, config, _ai, *, command, command_event_id, ai_enabled):
+            self.assertEqual((command, command_event_id, ai_enabled), ('Test', '$slow', False))
+            accepted_event = self.bot.transaction_events[accepted_transaction]
+            self.assertIn('Test angenommen',
+                          self.bot.events[CONTROL, accepted_event]['content']['body'])
+            return [{'msg': 'Fertig', 'html_msg': '<p>Fertig</p>', 'room_id': CONTROL,
+                     'thread_root_part': None, 'transaction_id': 'result-transaction',
+                     'event_id': None}]
+
+        with patch('matrix_commands.build_test_plan', side_effect=plan):
+            MatrixCommandListener(self.bot, self.config, self.state, self.ai,
+                                  account_factory=account_factory).drain()
+        self.assertEqual(self.bot.send_attempts, [accepted_transaction, 'result-transaction'])
+
+    def test_wait_ack_retry_reuses_transaction_without_duplicate(self):
+        self.state.bootstrap('s0')
+        self.state.record_sync('s1', [('$restart', 'Test')])
+        digest = hashlib.sha256(b'$restart').hexdigest()[:40]
+        accepted_transaction = 'control-' + digest + '-accepted'
+        calls = 0
+
+        def account_factory():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise KeyboardInterrupt('synthetic process stop')
+            return exchange_with()
+
+        listener = MatrixCommandListener(self.bot, self.config, self.state, self.ai,
+                                         account_factory=account_factory)
+        with self.assertRaisesRegex(KeyboardInterrupt, 'synthetic process stop'):
+            listener.drain()
+        self.assertEqual(self.state.head()['status'], 'queued')
+        with patch('matrix_commands.build_test_plan', return_value=[{
+                'msg': 'Fertig', 'html_msg': '<p>Fertig</p>', 'room_id': CONTROL,
+                'thread_root_part': None, 'transaction_id': 'result-after-restart',
+                'event_id': None}]):
+            listener.drain()
+        self.assertEqual(self.bot.send_attempts[:2], [accepted_transaction, accepted_transaction])
+        self.assertEqual(sum(value == accepted_transaction
+                             for value in self.bot.transaction_events), 1)
+        self.assertEqual(self.state.snapshot()['queue'], [])
+
+    def test_wait_ack_failure_stops_before_exchange_or_ai(self):
+        self.state.bootstrap('s0')
+        self.state.record_sync('s1', [('$offline', 'Test')])
+        self.bot.send_message = Mock(side_effect=MatrixError('matrix_network_error'))
+        account_factory = Mock(side_effect=AssertionError('Exchange must not be called'))
+        listener = MatrixCommandListener(self.bot, self.config, self.state, self.ai,
+                                         account_factory=account_factory)
+        with self.assertRaisesRegex(MatrixError, 'matrix_network_error'):
+            listener.drain()
+        account_factory.assert_not_called()
+        self.ai.render.assert_not_called()
+        self.assertEqual(self.state.head()['status'], 'queued')
+
+    def test_wait_ack_is_private_unique_and_mentions_ai_delay(self):
+        first = build_test_wait_ack(self.config, '$one', 'Test', True)
+        second = build_test_wait_ack(self.config, '$two', 'Test', True)
+        no_ai = build_test_wait_ack(self.config, '$three', 'Test 2', False)
+        self.assertEqual(first['room_id'], CONTROL)
+        self.assertNotEqual(first['transaction_id'], second['transaction_id'])
+        self.assertTrue(first['transaction_id'].endswith('-accepted'))
+        self.assertIn('mehrere Minuten', first['msg'])
+        self.assertIn('echten Zielkanal', no_ai['msg'])
+        self.assertNotIn('mehrere Minuten', no_ai['msg'])
+        ai_off = Mock()
+        ai_off.render.return_value = None
+        planned = build_test_plan(exchange_with(), self.config, ai_off, command='Test',
+                                  command_event_id='$one', ai_enabled=False)
+        self.assertNotIn(first['transaction_id'],
+                         {part['transaction_id'] for part in planned})
+
+    def test_test_failure_notice_distinguishes_ack_from_test_content(self):
+        notice = build_failure_ack(self.config, '$failed', 'test_failed')
+        self.assertIn('keine Testinhalte', notice[0]['msg'])
+        self.assertNotIn('nichts neu versendet', notice[0]['msg'])
 
     def test_unsafe_room_stops_before_any_command(self):
         self.bot.state = room_state('@third:example.org')

@@ -8,7 +8,7 @@ import unicodedata
 from ai_summary import SummaryUnavailable
 from control_state import COMMANDS, MAX_DELIVERY_FAILURES, ControlStateError
 from manual_delivery import (build_delivery_failure_ack, build_failure_ack, build_test_plan,
-                             build_toggle_ack, ManualDeliveryError)
+                             build_test_wait_ack, build_toggle_ack, ManualDeliveryError)
 from matrixbot import MatrixError
 
 
@@ -154,6 +154,11 @@ class MatrixCommandListener:
             self.state.plan_head(event_id, enabled, build_toggle_ack(self.config, event_id, enabled))
             return
         ai_enabled = self.state.snapshot()['ai_enabled']
+        wait_ack = build_test_wait_ack(self.config, event_id, command, ai_enabled)
+        wait_event = self.bot.send_message(
+            msg=wait_ack['msg'], html_msg=wait_ack['html_msg'], room_id=wait_ack['room_id'],
+            transaction_id=wait_ack['transaction_id'])
+        self._verify(wait_ack, wait_event, None)
         try:
             exchange = self.account_factory()
             parts = build_test_plan(exchange, self.config, self.ai_service, command=command,

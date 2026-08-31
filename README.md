@@ -45,6 +45,11 @@ Der zum Zeitpunkt des Befehls gültige KI-Schalter gilt für den ganzen Test. Be
 `Test 2` erzeugt jedoch absichtlich eine echte, nicht automatisch widerrufbare
 Matrix-Nachricht.
 
+`Test` und `Test 2` werden vor Exchange- oder KI-Arbeit sofort im privaten
+Kontrollraum bestätigt. Bei eingeschalteter KI weist die Bestätigung darauf hin,
+dass die Vorbereitung mehrere Minuten dauern kann. Die Verarbeitung bleibt seriell;
+weitere Testbefehle werden nach dem laufenden Test eingelesen und bearbeitet.
+
 ## Sicherheitsgrenzen der Steuerung
 
 Ein Befehl gilt ausschließlich, wenn er
@@ -62,8 +67,9 @@ allerersten Start wird nur der aktuelle `/sync`-Cursor gespeichert; vorhandene
 alte Chatnachrichten werden nicht ausgeführt. Begrenzte Timelines oder ein
 unsicherer Raum führen zu einem fail-closed Stopp der Steuerung.
 
-Geplante Zustellungen werden vor dem ersten Matrix-Versand vollständig eingefroren
-und in `/var/lib/methodenbot/control/state.json` mit Modus 0600 journalisiert.
+Nach der idempotenten privaten Wartebestätigung werden alle Testinhalte vor ihrem
+ersten Matrix-Versand vollständig eingefroren und in
+`/var/lib/methodenbot/control/state.json` mit Modus 0600 journalisiert.
 Deterministische Matrix-Transaktions-IDs, Readback und ein geschützter persistenter
 Matrix-Token verhindern Wiederholungen nach einem Crash. Erledigte Nachrichteninhalte
 werden aus dem Journal entfernt. Vorübergehende Zustellfehler werden höchstens fünfmal
