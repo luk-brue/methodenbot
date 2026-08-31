@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from digest_service import (DigestService, DigestServiceError, digest_command_from_event,
-                            split_markdown)
+                            markdown_to_matrix_html, split_markdown)
 from digest_state import DigestState, DigestStateError
 import digest_upload_receiver
 import digest_upload
@@ -68,15 +68,18 @@ class FakeBot:
     def get_room_state(self, room_id):
         return copy.deepcopy(self.states[room_id])
 
-    def send_message(self, msg, room_id=None, transaction_id=None, **_kwargs):
-        self.send_attempts.append((room_id, transaction_id, msg))
+    def send_message(self, msg, room_id=None, transaction_id=None, html_msg=None, **_kwargs):
+        self.send_attempts.append((room_id, transaction_id, msg, html_msg))
         if transaction_id in self.transactions:
             return self.transactions[transaction_id]
         event_id = '$sent-' + str(len(self.transactions) + 1)
         self.transactions[transaction_id] = event_id
+        content = {'msgtype': 'm.text', 'body': msg}
+        if html_msg is not None:
+            content.update(format='org.matrix.custom.html', formatted_body=html_msg)
         self.events[room_id, event_id] = {
             'event_id': event_id, 'type': 'm.room.message', 'sender': BOT,
-            'content': {'msgtype': 'm.text', 'body': msg}}
+            'content': content}
         return event_id
 
     def read_event(self, room_id, event_id):
@@ -194,6 +197,24 @@ class DigestTests(unittest.TestCase):
         recipient = snapshot['digests']['2026-08-28']['recipients'][USER]
         self.assertEqual(recipient['status'], 'delivered')
         self.assertEqual(''.join(value[2] for value in self.bot.send_attempts), markdown)
+        self.assertEqual(self.bot.send_attempts[0][3],
+                         '<h1>Wochenüberblick</h1><p>Eine geprüfte Zusammenfassung.</p>')
+
+    def test_markdown_html_formats_digest_and_escapes_source(self):
+        markdown = ('# Titel & Befund\n\n**Berichtszeitraum:** 22.–28. August  \n'
+                    '*Einordnung*\n\n- **DOI/Link:** '
+                    '[Beleg](https://doi.org/10.1/example?x=1&y=2)\n'
+                    '- <script>alert(1)</script>\n\n'
+                    '[Unsicher](javascript:alert(1))\n')
+        rendered = markdown_to_matrix_html(markdown)
+        self.assertIn('<h1>Titel &amp; Befund</h1>', rendered)
+        self.assertIn('<strong>Berichtszeitraum:</strong>', rendered)
+        self.assertIn('<br><em>Einordnung</em>', rendered)
+        self.assertIn('<ul><li><strong>DOI/Link:</strong> '
+                      '<a href="https://doi.org/10.1/example?x=1&amp;y=2">Beleg</a></li>',
+                      rendered)
+        self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;', rendered)
+        self.assertNotIn('javascript:', rendered)
 
     def test_same_date_with_changed_content_stops_fail_closed(self):
         inbox = Path(self.config.digest_inbox_dir)
@@ -212,8 +233,8 @@ class DigestTests(unittest.TestCase):
         parts = split_markdown(text)
         self.assertGreater(len(parts), 1)
         self.assertEqual(''.join(parts), text)
-        self.assertTrue(all(matrix_message_content(part)[1] <= MAX_EVENT_CONTENT_BYTES
-                            for part in parts))
+        self.assertTrue(all(matrix_message_content(
+            part, markdown_to_matrix_html(part))[1] <= MAX_EVENT_CONTENT_BYTES for part in parts))
 
     def test_restricted_receiver_checks_hash_and_writes_private_file(self):
         inbox = Path(self.directory.name) / 'upload'

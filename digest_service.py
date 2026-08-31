@@ -2,6 +2,7 @@
 
 from datetime import date as Date
 import hashlib
+import html
 import logging
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from urllib.parse import urlsplit
 
 from digest_state import DigestStateError, MAX_DELIVERY_FAILURES
 from matrixbot import MAX_EVENT_CONTENT_BYTES, MatrixError, matrix_message_content
@@ -20,10 +22,133 @@ logger = logging.getLogger(__name__)
 COMMANDS = {'Digest', 'Digest aus'}
 MAX_DIGEST_BYTES = 1_000_000
 DIGEST_NAME = re.compile(r'(\d{4}-\d{2}-\d{2})-methoden-digest\.md')
+INLINE_MARKDOWN = re.compile(
+    r'`([^`\n]+)`|\[([^\]\n]+)\]\(([^)\s]+)\)|\*\*([^*\n]+)\*\*|(?<!\*)\*([^*\n]+)\*(?!\*)')
+HEADING = re.compile(r'^(#{1,6})[ \t]+(.+?)\s*$')
+UNORDERED_ITEM = re.compile(r'^[ \t]*[-+*][ \t]+(.+?)\s*$')
+ORDERED_ITEM = re.compile(r'^[ \t]*\d+\.[ \t]+(.+?)\s*$')
 
 
 class DigestServiceError(RuntimeError):
     pass
+
+
+def _safe_link(url):
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    return (parsed.scheme in ('http', 'https') and bool(parsed.hostname)
+            and parsed.username is None and parsed.password is None)
+
+
+def _inline_markdown(text):
+    """Render the digest's inline Markdown while treating all source HTML as text."""
+    output, position = [], 0
+    for match in INLINE_MARKDOWN.finditer(text):
+        output.append(html.escape(text[position:match.start()]))
+        if match.group(1) is not None:
+            output.append('<code>' + html.escape(match.group(1)) + '</code>')
+        elif match.group(2) is not None:
+            label, url = match.group(2), match.group(3)
+            if _safe_link(url):
+                output.append('<a href="' + html.escape(url, quote=True) + '">'
+                              + html.escape(label) + '</a>')
+            else:
+                output.append(html.escape(label))
+        elif match.group(4) is not None:
+            output.append('<strong>' + html.escape(match.group(4)) + '</strong>')
+        else:
+            output.append('<em>' + html.escape(match.group(5)) + '</em>')
+        position = match.end()
+    output.append(html.escape(text[position:]))
+    return ''.join(output)
+
+
+def _paragraph(lines):
+    rendered = []
+    for index, line in enumerate(lines):
+        hard_break = line.endswith('  ')
+        rendered.append(_inline_markdown(line[:-2] if hard_break else line))
+        if index + 1 < len(lines):
+            rendered.append('<br>' if hard_break else ' ')
+    return ''.join(rendered)
+
+
+def markdown_to_matrix_html(text):
+    """Render a conservative Markdown subset accepted by Matrix clients."""
+    if not isinstance(text, str) or not text:
+        raise DigestServiceError('empty_digest')
+    lines, blocks, index = text.splitlines(), [], 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            index += 1
+            continue
+        if line.startswith('```'):
+            index += 1
+            code = []
+            while index < len(lines) and not lines[index].startswith('```'):
+                code.append(lines[index])
+                index += 1
+            if index < len(lines):
+                index += 1
+            blocks.append('<pre><code>' + html.escape('\n'.join(code)) + '</code></pre>')
+            continue
+        heading = HEADING.match(line)
+        if heading:
+            level = len(heading.group(1))
+            blocks.append(f'<h{level}>' + _inline_markdown(heading.group(2))
+                          + f'</h{level}>')
+            index += 1
+            continue
+        if re.fullmatch(r'[ \t]*([-*_])[ \t]*\1[ \t]*\1(?:[ \t]*\1)*[ \t]*', line):
+            blocks.append('<hr>')
+            index += 1
+            continue
+        unordered = UNORDERED_ITEM.match(line)
+        if unordered:
+            items = []
+            while index < len(lines):
+                item = UNORDERED_ITEM.match(lines[index])
+                if not item:
+                    break
+                items.append('<li>' + _inline_markdown(item.group(1)) + '</li>')
+                index += 1
+            blocks.append('<ul>' + ''.join(items) + '</ul>')
+            continue
+        ordered = ORDERED_ITEM.match(line)
+        if ordered:
+            items = []
+            while index < len(lines):
+                item = ORDERED_ITEM.match(lines[index])
+                if not item:
+                    break
+                items.append('<li>' + _inline_markdown(item.group(1)) + '</li>')
+                index += 1
+            blocks.append('<ol>' + ''.join(items) + '</ol>')
+            continue
+        if line.startswith('> '):
+            quote = []
+            while index < len(lines) and lines[index].startswith('> '):
+                quote.append(lines[index][2:])
+                index += 1
+            blocks.append('<blockquote><p>' + _paragraph(quote) + '</p></blockquote>')
+            continue
+        paragraph = []
+        while index < len(lines):
+            candidate = lines[index]
+            if not candidate.strip():
+                break
+            if paragraph and (candidate.startswith('```') or HEADING.match(candidate)
+                              or UNORDERED_ITEM.match(candidate)
+                              or ORDERED_ITEM.match(candidate)
+                              or candidate.startswith('> ')):
+                break
+            paragraph.append(candidate)
+            index += 1
+        blocks.append('<p>' + _paragraph(paragraph) + '</p>')
+    return ''.join(blocks)
 
 
 def digest_command_from_event(event):
@@ -76,13 +201,14 @@ def split_markdown(text):
         raise DigestServiceError('empty_digest')
     parts, remaining = [], text
     while remaining:
-        if matrix_message_content(remaining)[1] <= MAX_EVENT_CONTENT_BYTES:
+        if matrix_message_content(remaining, markdown_to_matrix_html(remaining))[1] <= MAX_EVENT_CONTENT_BYTES:
             parts.append(remaining)
             break
         low, high, best = 1, len(remaining), 0
         while low <= high:
             middle = (low + high) // 2
-            if matrix_message_content(remaining[:middle])[1] <= MAX_EVENT_CONTENT_BYTES:
+            candidate = remaining[:middle]
+            if matrix_message_content(candidate, markdown_to_matrix_html(candidate))[1] <= MAX_EVENT_CONTENT_BYTES:
                 best, low = middle, middle + 1
             else:
                 high = middle - 1
@@ -234,13 +360,16 @@ class DigestService:
                     commands.append((room_id, *command))
         return commands
 
-    def _verify_text(self, room_id, event_id, text):
+    def _verify_text(self, room_id, event_id, text, formatted=None):
         event = self.bot.read_event(room_id, event_id)
         content = event.get('content', {}) if isinstance(event, dict) else {}
         if (event.get('event_id', event_id) != event_id
                 or event.get('type') != 'm.room.message'
                 or event.get('sender') != self.bot.user_id
-                or content.get('body') != text):
+                or content.get('body') != text
+                or (formatted is not None
+                    and (content.get('format') != 'org.matrix.custom.html'
+                         or content.get('formatted_body') != formatted))):
             raise MatrixError('matrix_readback_mismatch')
 
     def _process_command(self, room_id, event_id, user_id, command):
@@ -343,14 +472,16 @@ class DigestService:
                     continue
                 try:
                     for index, text in enumerate(parts):
+                        formatted = markdown_to_matrix_html(text)
                         event_id = recipient['parts'][index]
                         transaction = ('digest-' + date.replace('-', '') + '-'
                                        + digest['sha256'][:12] + '-'
                                        + _transaction(user_id)[:12] + '-' + str(index + 1))
                         if event_id is None:
                             event_id = self.bot.send_message(
-                                text, room_id=recipient['room_id'], transaction_id=transaction)
-                        self._verify_text(recipient['room_id'], event_id, text)
+                                text, room_id=recipient['room_id'], html_msg=formatted,
+                                transaction_id=transaction)
+                        self._verify_text(recipient['room_id'], event_id, text, formatted)
                         self.state.record_part(date, user_id, index, event_id)
                         recipient['parts'][index] = event_id
                     self.state.finish_recipient(date, user_id, 'delivered')
