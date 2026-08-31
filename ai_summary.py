@@ -159,7 +159,7 @@ class AISettings:
                 fd = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW)
                 with os.fdopen(fd, 'r') as handle:
                     metadata = os.fstat(handle.fileno())
-                    secure_mode = (stat.S_IMODE(metadata.st_mode) == 0o400
+                    secure_mode = (stat.S_IMODE(metadata.st_mode) in (0o400, 0o440)
                                    if is_systemd_credential
                                    else not metadata.st_mode & 0o077)
                     secure_owner = (is_systemd_credential

@@ -214,11 +214,20 @@ class SettingsTests(NoNetworkTest):
                   patch('ai_summary.os.fstat', return_value=idmapped)):
                 self.assertEqual(settings.read_key(), 'UNIT-TEST-KEY')
 
-    def test_systemd_credential_still_requires_mode_0400(self):
+    def test_systemd_credential_accepts_acl_backed_root_owned_file(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'gwdg-local-token'
             path.write_text('UNIT-TEST-KEY\n')
-            path.chmod(0o600)
+            path.chmod(0o440)
+            settings = AISettings(enabled=True, transfer_approved=True, api_key_file=str(path))
+            with patch.dict(os.environ, {'CREDENTIALS_DIRECTORY': directory}):
+                self.assertEqual(settings.read_key(), 'UNIT-TEST-KEY')
+
+    def test_systemd_credential_rejects_other_read_bits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'gwdg-local-token'
+            path.write_text('UNIT-TEST-KEY\n')
+            path.chmod(0o444)
             settings = AISettings(enabled=True, transfer_approved=True, api_key_file=str(path))
             with patch.dict(os.environ, {'CREDENTIALS_DIRECTORY': directory}):
                 with self.assertRaisesRegex(SummaryUnavailable, 'key_file_permissions'):
