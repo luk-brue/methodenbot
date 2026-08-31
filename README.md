@@ -81,6 +81,58 @@ Auch `processed_emails.csv` ist ein fail-closed Zustelljournal: vorhandene besch
 unsichere oder unlesbare Dateien stoppen den Dienst, statt als leere Liste interpretiert
 zu werden. Änderungen erfolgen atomar und werden auf Datei und Verzeichnis synchronisiert.
 
+## Wöchentlicher Methoden-Journal-Digest
+
+Interessierte Personen eröffnen selbst einen privaten Raum mit dem Methodenbot und
+senden dort als reine Textnachricht exakt `Digest`. Der Bot nimmt neue prüfbare
+Raumeinladungen automatisch an und bestätigt anschließend das Abonnement. `Digest aus`
+beendet es wieder. Pro Matrix-Benutzer-ID ist genau ein Zielraum aktiv; ein neues
+`Digest` in einem anderen privaten Raum ersetzt den bisherigen Zielraum.
+
+Vor der Anmeldung und vor jedem Wochenversand prüft der Bot, dass ausschließlich die
+abonnierende Person und der Bot Mitglieder sind, der Raum nur per Einladung zugänglich
+und nicht öffentlich lesbar ist. Gruppenräume werden ohne öffentliche Bot-Antwort
+ignoriert. Der bestehende Matrix-Client kann keine Ende-zu-Ende-Verschlüsselung; daher
+werden verschlüsselte Einladungen nicht angenommen. Diese Grenze wird mit
+`MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM=true` bewusst freigegeben.
+
+Die geprüfte Datei gelangt nicht über Git oder die Exchange-Inbox in den Bot, sondern
+über einen eng begrenzten SSH-Upload:
+
+1. Die Freitags-Automation erzeugt und prüft lokal
+   `YYYY-MM-DD-methoden-digest.md`.
+2. `digest_upload.py` validiert Dateiname, Größe und UTF-8, berechnet SHA-256 und
+   überträgt die Bytes über einen dedizierten SSH-Config-Alias.
+3. Der öffentliche Schlüssel dieses Uploaders erhält serverseitig ausschließlich den
+   erzwungenen Befehl `digest_upload_receiver.py`; Shell, PTY und Weiterleitungen
+   bleiben durch die OpenSSH-Option `restrict` gesperrt.
+4. Der Receiver bestätigt nur eine atomar und mit passendem Hash unter
+   `/var/lib/methodenbot/digest/inbox/` gespeicherte Datei. Erst danach meldet der
+   lokale Uploader Erfolg.
+5. Der laufende Bot friert Inhalt, Empfängerliste und Hash geschützt ein und sendet
+   die Markdown-Datei nötigenfalls in unveränderten, größenbegrenzten Teilen. Stabile
+   Matrix-Transaktions-IDs und Readback verhindern Doppelversand nach einem Neustart.
+
+Beispiel für den lokalen Aufruf nach erfolgreicher Digest-Prüfung:
+
+```sh
+python3 digest_upload.py \
+  --target methodenbot-digest-upload \
+  /Users/fscharf/Downloads/Methoden-Journal-Digest/YYYY-MM-DD-methoden-digest.md
+```
+
+Der SSH-Alias enthält Host, Benutzer und den Pfad zu einem eigenen Upload-Schlüssel;
+er enthält keine Schlüsselwerte im Repository. Der passende `authorized_keys`-Eintrag
+muss durch eine Serveradministration einmalig mit einem absoluten Python- und
+Releasepfad eingerichtet werden, sinngemäß:
+
+```text
+restrict,command="/home/methodenbot/methodenbot/venv/bin/python -B /srv/methodenbot-final/current/digest_upload_receiver.py" ssh-ed25519 PUBLIC_KEY_NUR_FUER_DIGEST_UPLOAD
+```
+
+Gleicher Lauf-Tag mit anderem Hash wird absichtlich fail-closed abgelehnt: Eine bereits
+begonnene Wochenzustellung wird nicht still durch geänderten Inhalt ersetzt.
+
 ## Laufzeitpfade
 
 - Code: `/srv/methodenbot-final/releases/<release>/`
@@ -89,6 +141,8 @@ zu werden. Änderungen erfolgen atomar und werden auf Datei und Verzeichnis sync
 - lokaler Gateway-Token: systemd-Credential `gwdg-local-token`
 - verarbeitete IDs, Statistik, Matrix-Sitzung und Kontrollzustand:
   `/var/lib/methodenbot/`
+- Digest-Abonnements, Zustelljournal, eingefrorene Inhalte und Upload-Eingang:
+  `/var/lib/methodenbot/digest/`
 - bestehende virtuelle Umgebung: `/home/methodenbot/methodenbot/venv`
 
 Der Releasebaum enthält keine `.env`, CSV, Logs, Token oder Schlüssel.

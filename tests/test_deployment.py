@@ -35,6 +35,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertNotIn('MUST-NOT-SURVIVE', result)
         self.assertNotIn('METHODENBOT_EXPERIMENT_LIVE', result)
         self.assertIn('MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM=true', result)
+        self.assertIn('MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM=true', result)
         self.assertIn('METHODENBOT_AI_DEFAULT_ENABLED=false', result)
         self.assertIn('MATRIX_CONTROL_USER=@controller:matrix.invalid', result)
 
@@ -163,6 +164,8 @@ class DeploymentTests(unittest.TestCase):
             state = Path(folder)
             control = state / 'control/state.json'
             control.parent.mkdir(mode=0o700)
+            digest = state / 'digest/state.json'
+            digest.parent.mkdir(mode=0o700)
             identity = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
             waits = []
 
@@ -170,6 +173,8 @@ class DeploymentTests(unittest.TestCase):
                 waits.append(seconds)
                 control.write_text('{"since":"cursor","ai_enabled":false}\n')
                 control.chmod(0o600)
+                digest.write_text('{"since":"digest-cursor"}\n')
+                digest.chmod(0o600)
 
             release = Path('/srv/methodenbot-final/releases/final-one')
             with (patch.object(manager, 'STATE', state),

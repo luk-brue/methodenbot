@@ -9,6 +9,8 @@ import traceback
 from ai_service import AISummaryService
 from configuration import Configuration
 from control_state import ControlState
+from digest_service import DigestService
+from digest_state import DigestState
 import exchangemail
 from matrix_commands import MatrixCommandListener
 import matrixbot
@@ -30,6 +32,7 @@ def main():
     os.chdir(Path(__file__).resolve().parent)
 
     state = ControlState(config.control_state_dir, ai_default=config.ai_default_enabled)
+    digest_state = DigestState(config.digest_state_dir)
     ai_service = AISummaryService(config.ai)
     if config.ai.api_key or not config.ai.api_key_file:
         raise RuntimeError('Finaler Dienst verlangt eine lokale Credential-Datei, keinen direkten API-Key')
@@ -41,10 +44,13 @@ def main():
     listener = MatrixCommandListener(
         bot, config, state, ai_service,
         account_factory=lambda: exchangemail.init_exchange_connection(config))
+    digest_service = DigestService(bot, config, digest_state)
     # Bootstrap synchronously: old personal messages must be skipped before the
     # normal mail service begins. Security failure stops the whole startup.
     state.acquire_process_lock()
     listener.bootstrap()
+    digest_state.acquire_process_lock()
+    digest_service.bootstrap()
 
     account = exchangemail.init_exchange_connection(config)
     stats = StatsTableManager(config.stats_file)
@@ -52,7 +58,10 @@ def main():
 
     control_thread = threading.Thread(target=listener.run_forever,
                                       name='matrix-control', daemon=True)
+    digest_thread = threading.Thread(target=digest_service.run_forever,
+                                     name='matrix-digest', daemon=True)
     control_thread.start()
+    digest_thread.start()
     try:
         logger.info("Lade E-Mails aus der INBOX (max. 100)...")
         messages = list(account.inbox.all().order_by('-datetime_received')[:100])
@@ -72,7 +81,9 @@ def main():
         raise
     finally:
         listener.stop_event.set()
+        digest_service.stop_event.set()
         control_thread.join(timeout=5)
+        digest_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

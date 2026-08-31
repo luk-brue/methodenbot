@@ -312,6 +312,16 @@ class MatrixBot:
     def get_room_state(self, room_id):
         return self._request_array('/rooms/' + quote(room_id, safe='') + '/state')
 
+    def join_room(self, room_id):
+        if not isinstance(room_id, str) or not room_id.startswith('!'):
+            raise MatrixError('invalid_matrix_room')
+        body = self.request_json('POST', '/join/' + quote(room_id, safe=''), payload={},
+                                 idempotent=True)
+        joined = body.get('room_id') if isinstance(body, dict) else None
+        if joined != room_id:
+            raise MatrixError('matrix_join_unconfirmed')
+        return joined
+
     def direct_mapping(self):
         if not isinstance(self.user_id, str):
             raise MatrixError('matrix_identity_missing')

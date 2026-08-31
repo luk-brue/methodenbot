@@ -48,6 +48,16 @@ class API:
 
 
 class MatrixFinalTests(unittest.TestCase):
+    def test_join_room_requires_confirmed_matching_room(self):
+        api = API()
+        api.send_responses = [Response(200, {'room_id': '!private:example.invalid'})]
+        config = SimpleNamespace(matrix_server='https://matrix.example.invalid',
+                                 matrix_user='@bot:example.invalid', matrix_password='secret',
+                                 matrix_room_id='!room:example.invalid', matrix_device_id='STABLE')
+        bot = MatrixBot(config, session_factory=api.factory, sleep=lambda seconds: None)
+        self.assertEqual(bot.join_room('!private:example.invalid'), '!private:example.invalid')
+        self.assertTrue(api.requests[-1][1].endswith('/join/%21private%3Aexample.invalid'))
+
     def test_401_refresh_uses_new_header_and_identical_transaction_url(self):
         api = API()
         config = SimpleNamespace(matrix_server='https://matrix.example.invalid',

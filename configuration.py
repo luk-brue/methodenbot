@@ -41,6 +41,10 @@ class Configuration:
         self.matrix_token_file = os.getenv("MATRIX_TOKEN_FILE", str(self.state_dir / 'matrix-session.json'))
         self.allow_unencrypted_control_dm = _enabled("MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM")
         self.control_state_dir = os.getenv("METHODENBOT_CONTROL_STATE_DIR", str(self.state_dir / 'control'))
+        self.digest_state_dir = os.getenv("METHODENBOT_DIGEST_STATE_DIR", str(self.state_dir / 'digest'))
+        self.digest_inbox_dir = os.getenv(
+            "METHODENBOT_DIGEST_INBOX", str(self.state_dir / 'digest' / 'inbox'))
+        self.allow_unencrypted_digest_dm = _enabled("MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM")
         self.ai_default_enabled = _enabled("METHODENBOT_AI_DEFAULT_ENABLED")
         self.google_form_link = os.getenv("GOOGLE_FORM_LINK")
         self.dev_enable_token_cache = _enabled("DEV_ENABLE_TOKEN_CACHE")
@@ -69,5 +73,7 @@ class Configuration:
             raise RuntimeError('Kontrollraum und produktiver Zielraum müssen verschieden sein')
         if not self.allow_unencrypted_control_dm:
             raise RuntimeError('Unverschlüsselte Kontroll-PN ist nicht ausdrücklich freigegeben')
+        if not self.allow_unencrypted_digest_dm:
+            raise RuntimeError('Unverschlüsselte Digest-PNs sind nicht ausdrücklich freigegeben')
         if not self.matrix_server.startswith('https://'):
             raise RuntimeError('MATRIX_SERVER muss HTTPS verwenden')

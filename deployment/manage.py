@@ -168,6 +168,7 @@ def final_runtime_env(source):
         'MATRIX_CONTROL_USER': control_user,
         'MATRIX_DEVICE_ID': 'METHODENBOT_FINAL_2026_08',
         'MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM': 'true',
+        'MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM': 'true',
         'METHODENBOT_AI_ENABLED': 'true',
         'METHODENBOT_AI_DEFAULT_ENABLED': 'false',
         'GWDG_DATA_TRANSFER_APPROVED': 'true',
@@ -176,11 +177,16 @@ def final_runtime_env(source):
     removed = set(managed) | {
         'GWDG_API_KEY', 'GWDG_API_KEY_FILE', 'METHODENBOT_EXPERIMENT_LIVE',
         'MATRIX_ALLOW_UNENCRYPTED_TEST_DM', 'METHODENBOT_STATE_DIR',
-        'METHODENBOT_ENV_FILE', 'MATRIX_TOKEN_FILE'}
+        'METHODENBOT_ENV_FILE', 'MATRIX_TOKEN_FILE',
+        'MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM'}
     key_pattern = re.compile(r'^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=')
+    marker = '# Methodenbot final: zentral verwaltete Werte'
     kept = [line for line in lines
-            if not ((match := key_pattern.match(line)) and match.group(1) in removed)]
-    kept.extend(['', '# Methodenbot final: zentral verwaltete Werte',
+            if line.strip() != marker
+            and not ((match := key_pattern.match(line)) and match.group(1) in removed)]
+    while kept and not kept[-1].strip():
+        kept.pop()
+    kept.extend(['', marker,
                  *(key + '=' + value for key, value in managed.items())])
     values = env_values(kept)
     required = ('UK_NUMMER', 'EMAIL_ADDRESS', 'EMAIL_PASSWORD', 'EWS_ENDPOINT',
@@ -288,6 +294,7 @@ def validate_existing_runtime(identity):
     expected = {
         'MATRIX_DEVICE_ID': 'METHODENBOT_FINAL_2026_08',
         'MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM': 'true',
+        'MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM': 'true',
         'METHODENBOT_AI_ENABLED': 'true',
         'METHODENBOT_AI_DEFAULT_ENABLED': 'false',
         'GWDG_DATA_TRANSFER_APPROVED': 'true',
@@ -318,6 +325,11 @@ def prepare_runtime_configuration(identity):
     os.chown(ETC, 0, identity.pw_gid)
     os.chmod(ETC, 0o750)
     if existing is not None:
+        validate_protected_file(RUNTIME_ENV, mode=0o640, uid=0, gid=identity.pw_gid)
+        validate_protected_file(LOCAL_TOKEN, mode=0o600, uid=0, gid=0)
+        migrated = final_runtime_env(RUNTIME_ENV)
+        if migrated != RUNTIME_ENV.read_bytes():
+            atomic_write(RUNTIME_ENV, migrated, 0o640, 0, identity.pw_gid)
         validate_existing_runtime(identity)
         return existing
     atomic_write(RUNTIME_ENV, final_runtime_env(OLD / '.env'), 0o640, 0, identity.pw_gid)
@@ -565,30 +577,37 @@ def verify_service(expected_release, *, attempts=20, stable_seconds=5, sleep=tim
 
 
 def wait_control_ready(expected_release, expected_pid, identity, *, attempts=90, sleep=time.sleep):
-    """Wait for the synchronous Matrix bootstrap without accepting a PID restart."""
+    """Wait for both synchronous Matrix cursors without accepting a PID restart."""
     control_file = STATE / 'control/state.json'
+    digest_file = STATE / 'digest/state.json'
     for attempt in range(attempts):
         if service_snapshot(expected_release) != expected_pid:
             raise DeployError('service_not_stable')
         try:
             validate_protected_file(control_file, mode=0o600,
                                     uid=identity.pw_uid, gid=identity.pw_gid)
+            validate_protected_file(digest_file, mode=0o600,
+                                    uid=identity.pw_uid, gid=identity.pw_gid)
         except DeployError as exc:
             if str(exc) != 'protected_runtime_file_missing':
                 raise
         else:
             try:
-                if control_file.stat().st_size > 2_000_000:
+                if control_file.stat().st_size > 2_000_000 or digest_file.stat().st_size > 4_000_000:
                     raise DeployError('control_state_invalid')
                 control = json.loads(control_file.read_text(encoding='utf-8'))
+                digest = json.loads(digest_file.read_text(encoding='utf-8'))
             except DeployError:
                 raise
             except (OSError, UnicodeError, ValueError, RecursionError):
                 raise DeployError('control_state_invalid') from None
             if (not isinstance(control, dict) or type(control.get('ai_enabled')) is not bool
-                    or control.get('since') is not None and not isinstance(control.get('since'), str)):
+                    or control.get('since') is not None and not isinstance(control.get('since'), str)
+                    or not isinstance(digest, dict)
+                    or digest.get('since') is not None and not isinstance(digest.get('since'), str)):
                 raise DeployError('control_state_invalid')
-            if isinstance(control.get('since'), str) and control['since']:
+            if (isinstance(control.get('since'), str) and control['since']
+                    and isinstance(digest.get('since'), str) and digest['since']):
                 return control
         if attempt + 1 < attempts:
             sleep(1)

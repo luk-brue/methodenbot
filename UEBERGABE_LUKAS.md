@@ -58,6 +58,9 @@ Befehle bleiben ausführbar.
 - `control_state.py` – atomarer 0600-Zustand und Prozess-Lock
 - `manual_delivery.py` – read-only Auswahl und Test-Rendering
 - `matrixbot.py` – Matrix-Transport, stabile Sitzung, 401/429 und Transaktions-IDs
+- `digest_service.py` – private `Digest`-/`Digest aus`-Befehle und Wochenversand
+- `digest_state.py` – geschützte Abonnements und idempotente Zustellbelege
+- `digest_upload.py` / `digest_upload_receiver.py` – hashgeprüfte SSH-Übergabe
 - `ai_service.py` – ausschließlich lokales Gateway und gemeinsamer Pacer
 - `ai_summary.py`, `summary_selection.py` – Minimierung, Auswahl und Darstellung
 - `form_table_compat.py` – kompatibler TH/TD- und TD/TD-Parser
@@ -75,6 +78,13 @@ mit 0700/0600. Das Journal kann während eines begonnenen Tests vorübergehend
 personenbezogene Originaltexte enthalten und wird nach bestätigter Zustellung
 bereinigt. Eine vorhandene beschädigte oder unsichere `processed_emails.csv`
 stoppt den Dienst fail-closed; sie wird niemals als leere Historie behandelt.
+
+Digest-Abonnements und eingefrorene Wocheninhalte liegen unter
+`/var/lib/methodenbot/digest`. Der Upload-Receiver akzeptiert ausschließlich eine
+UTF-8-Datei namens `YYYY-MM-DD-methoden-digest.md` über einen separaten, per
+`authorized_keys` erzwungenen SSH-Befehl. Der Methodenbot unterstützt weiterhin keine
+Ende-zu-Ende-Verschlüsselung; `Digest` funktioniert daher nur in unverschlüsselten
+privaten Zweier-Räumen.
 
 ## Prüfen und betreiben
 
