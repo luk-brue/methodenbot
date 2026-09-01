@@ -13,6 +13,8 @@ import uuid
 from ai_service import AISummaryService
 from configuration import Configuration
 from control_state import ControlState
+from digest_service import DigestService
+from digest_state import DigestState
 import exchangemail
 from matrix_commands import MatrixCommandListener, MatrixCommandWorker
 import matrixbot
@@ -75,6 +77,71 @@ def write_control_ready(base, bindings):
             pass
 
 
+class BackgroundServices:
+    """Bootstrap and run every Matrix-facing service as one tested capability set."""
+
+    def __init__(self, config, state, ai_service, bot):
+        self.config = config
+        self.state = state
+        self.ai_service = ai_service
+        self.bot = bot
+        clear_control_ready(config.control_state_dir)
+        self.digest_state = DigestState(config.digest_state_dir)
+        self.execution_lock = threading.Lock()
+        self.bindings = config.control_bindings()
+        self.listeners = []
+        ai_enabled = state.snapshot()['ai_enabled']
+        for index, (control_user, room_id) in enumerate(self.bindings):
+            listener_state = (state if index == 0 else ControlState(
+                controller_state_directory(config.control_state_dir, control_user, room_id),
+                ai_default=ai_enabled))
+            self.listeners.append(MatrixCommandListener(
+                bot, config, listener_state, ai_service,
+                account_factory=lambda: exchangemail.init_exchange_connection(config),
+                room_id=room_id, control_user=control_user, ai_state=state,
+                execution_lock=self.execution_lock))
+        self.digest_service = DigestService(bot, config, self.digest_state)
+
+        # Fail closed before mail streaming: every configured control room and
+        # the digest cursor must be safe and bootstrapped synchronously.
+        for listener in self.listeners:
+            listener.state.acquire_process_lock()
+            listener.bootstrap()
+        self.digest_state.acquire_process_lock()
+        self.digest_service.bootstrap()
+        write_control_ready(config.control_state_dir, self.bindings)
+
+        self.work_event = threading.Event()
+        self.worker = MatrixCommandWorker(self.listeners, self.work_event)
+        self.control_threads = [threading.Thread(
+            target=listener.run_poll_forever, args=(self.work_event,),
+            name='matrix-control-' + str(index), daemon=True)
+            for index, listener in enumerate(self.listeners, 1)]
+        self.worker_thread = threading.Thread(
+            target=self.worker.run_forever, name='matrix-control-worker', daemon=True)
+        self.digest_thread = threading.Thread(
+            target=self.digest_service.run_forever, name='matrix-digest', daemon=True)
+
+    def start(self):
+        self.worker_thread.start()
+        for thread in self.control_threads:
+            thread.start()
+        self.digest_thread.start()
+        if any(listener.state.head() is not None for listener in self.listeners):
+            self.work_event.set()
+
+    def stop(self):
+        for listener in self.listeners:
+            listener.stop_event.set()
+        self.worker.stop_event.set()
+        self.digest_service.stop_event.set()
+        self.work_event.set()
+        for thread in self.control_threads:
+            thread.join(timeout=5)
+        self.worker_thread.join(timeout=5)
+        self.digest_thread.join(timeout=5)
+
+
 def main():
     os.umask(0o077)
     config = Configuration()
@@ -83,7 +150,6 @@ def main():
     os.chdir(Path(__file__).resolve().parent)
 
     state = ControlState(config.control_state_dir, ai_default=config.ai_default_enabled)
-    clear_control_ready(config.control_state_dir)
     ai_service = AISummaryService(config.ai)
     if config.ai.api_key or not config.ai.api_key_file:
         raise RuntimeError('Finaler Dienst verlangt eine lokale Credential-Datei, keinen direkten API-Key')
@@ -92,42 +158,13 @@ def main():
     config.ai_service = ai_service
 
     bot = matrixbot.MatrixBot(config)
-    execution_lock = threading.Lock()
-    listeners = []
-    bindings = config.control_bindings()
-    for index, (control_user, room_id) in enumerate(bindings):
-        listener_state = (state if index == 0 else ControlState(
-            controller_state_directory(config.control_state_dir, control_user, room_id),
-            ai_default=state.snapshot()['ai_enabled']))
-        listeners.append(MatrixCommandListener(
-            bot, config, listener_state, ai_service,
-            account_factory=lambda: exchangemail.init_exchange_connection(config),
-            room_id=room_id, control_user=control_user, ai_state=state,
-            execution_lock=execution_lock))
-    # Bootstrap synchronously: old personal messages must be skipped before the
-    # normal mail service begins. Security failure stops the whole startup.
-    for listener in listeners:
-        listener.state.acquire_process_lock()
-        listener.bootstrap()
-    write_control_ready(config.control_state_dir, bindings)
+    background = BackgroundServices(config, state, ai_service, bot)
 
     account = exchangemail.init_exchange_connection(config)
     stats = StatsTableManager(config.stats_file)
     processed_emails = exchangemail.load_processed_emails(config.processed_file)
 
-    work_event = threading.Event()
-    worker = MatrixCommandWorker(listeners, work_event)
-    control_threads = [threading.Thread(
-        target=listener.run_poll_forever, args=(work_event,),
-        name='matrix-control-' + str(index), daemon=True)
-        for index, listener in enumerate(listeners, 1)]
-    worker_thread = threading.Thread(target=worker.run_forever,
-                                     name='matrix-control-worker', daemon=True)
-    worker_thread.start()
-    for control_thread in control_threads:
-        control_thread.start()
-    if any(listener.state.head() is not None for listener in listeners):
-        work_event.set()
+    background.start()
     try:
         logger.info("Lade E-Mails aus der INBOX (max. 100)...")
         messages = list(account.inbox.all().order_by('-datetime_received')[:100])
@@ -146,13 +183,7 @@ def main():
         logger.error(traceback.format_exc())
         raise
     finally:
-        for listener in listeners:
-            listener.stop_event.set()
-        worker.stop_event.set()
-        work_event.set()
-        for control_thread in control_threads:
-            control_thread.join(timeout=5)
-        worker_thread.join(timeout=5)
+        background.stop()
 
 
 if __name__ == "__main__":

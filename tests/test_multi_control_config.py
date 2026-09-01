@@ -41,6 +41,7 @@ BASE_ENV = {
     'MATRIX_CONSOLE_ROOM_ID': '!primary:example.invalid',
     'MATRIX_CONTROL_USER': '@primary:example.invalid',
     'MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM': 'true',
+    'MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM': 'true',
     'GOOGLE_FORM_LINK': 'https://form.example.invalid',
 }
 

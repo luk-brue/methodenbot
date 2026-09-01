@@ -9,6 +9,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import stat
 import threading
 import time
@@ -20,6 +21,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 MAX_EVENT_CONTENT_BYTES = 48_000
+MAX_MATRIX_FILE_BYTES = 1_000_000
+MATRIX_FILE_NAME = re.compile(r'\d{4}-\d{2}-\d{2}-methoden-artikel\.ris')
+MATRIX_CONTENT_URI = re.compile(r'mxc://([A-Za-z0-9._:-]+)/([A-Za-z0-9_-]+)')
 
 
 class MatrixError(RuntimeError):
@@ -249,6 +253,70 @@ class MatrixBot:
                 raise MatrixError('matrix_http_error', status=response.status_code)
             return self._json(response)
 
+    def request_media_json(self, method, path, *, raw=None, content_type=None,
+                           params=None, expected=(200,), idempotent=False,
+                           timeout=(5, 30)):
+        allowed = (path == '/_matrix/media/v1/create'
+                   or path.startswith('/_matrix/media/v3/upload/'))
+        if method not in ('POST', 'PUT') or not allowed:
+            raise MatrixError('matrix_media_request_not_allowed')
+        if raw is not None and (not isinstance(raw, bytes) or len(raw) > MAX_MATRIX_FILE_BYTES):
+            raise MatrixError('invalid_matrix_media')
+        refreshed = False
+        attempts = 0
+        while True:
+            attempts += 1
+            token = self.access_token
+            headers = {'Authorization': 'Bearer ' + token}
+            if content_type is not None:
+                headers['Content-Type'] = content_type
+            try:
+                with self._session() as session:
+                    response = session.request(
+                        method, self.homeserver + path, headers=headers, data=raw,
+                        params=params, timeout=timeout, allow_redirects=False)
+            except requests.RequestException:
+                if idempotent and attempts < 3:
+                    self._sleep(1)
+                    continue
+                raise MatrixError('matrix_media_network_error') from None
+            if response.status_code == 401 and not refreshed:
+                self.password_login(expected_old_token=token)
+                refreshed = True
+                continue
+            if response.status_code == 429 and idempotent and attempts < 3:
+                delay = self._retry_delay(response)
+                if delay <= 120:
+                    self._sleep(delay)
+                    continue
+            if response.status_code not in expected:
+                if idempotent and response.status_code in (500, 502, 503, 504) and attempts < 3:
+                    self._sleep(1)
+                    continue
+                raise MatrixError('matrix_media_http_error', status=response.status_code)
+            return self._json(response)
+
+    def create_media_uri(self):
+        body = self.request_media_json('POST', '/_matrix/media/v1/create')
+        content_uri = body.get('content_uri')
+        if not isinstance(content_uri, str) or MATRIX_CONTENT_URI.fullmatch(content_uri) is None:
+            raise MatrixError('matrix_media_create_unconfirmed')
+        return content_uri
+
+    def upload_media(self, content_uri, raw, filename,
+                     content_type='application/x-research-info-systems'):
+        match = MATRIX_CONTENT_URI.fullmatch(content_uri or '')
+        if (match is None or not isinstance(raw, bytes) or not 0 < len(raw) <= MAX_MATRIX_FILE_BYTES
+                or MATRIX_FILE_NAME.fullmatch(filename or '') is None
+                or content_type != 'application/x-research-info-systems'):
+            raise MatrixError('invalid_matrix_media')
+        path = ('/_matrix/media/v3/upload/' + quote(match.group(1), safe=':') + '/'
+                + quote(match.group(2), safe=''))
+        self.request_media_json('PUT', path, raw=raw, content_type=content_type,
+                                params={'filename': filename}, expected=(200, 409),
+                                idempotent=True, timeout=(5, 60))
+        return content_uri
+
     def token_whoami(self):
         body = self.request_json('GET', '/account/whoami')
         user_id = body.get('user_id')
@@ -257,8 +325,7 @@ class MatrixBot:
             raise MatrixError('matrix_identity_changed')
         return 200
 
-    def send_message(self, msg, room_id=None, thread_reply_to=None, html_msg=None,
-                     transaction_id=None):
+    def _send_content(self, content, room_id, transaction_id):
         room_id = room_id or self.room_id
         if not isinstance(room_id, str) or not room_id.startswith('!'):
             raise MatrixError('invalid_matrix_room')
@@ -266,7 +333,8 @@ class MatrixBot:
         if (not isinstance(transaction_id, str) or not 1 <= len(transaction_id) <= 200
                 or any(ord(char) < 33 or ord(char) > 126 for char in transaction_id)):
             raise MatrixError('invalid_matrix_transaction_id')
-        content, content_size = matrix_message_content(msg, html_msg, thread_reply_to)
+        content_size = len(json.dumps(
+            content, ensure_ascii=True, allow_nan=False).encode('utf-8'))
         if content_size > MAX_EVENT_CONTENT_BYTES:
             raise MatrixError('matrix_message_too_large')
         path = ('/rooms/' + quote(room_id, safe='') + '/send/m.room.message/'
@@ -276,6 +344,23 @@ class MatrixBot:
             raise MatrixError('matrix_send_unconfirmed')
         logger.info('Matrix-Nachricht bestätigt.')
         return event_id
+
+    def send_message(self, msg, room_id=None, thread_reply_to=None, html_msg=None,
+                     transaction_id=None):
+        content, _content_size = matrix_message_content(msg, html_msg, thread_reply_to)
+        return self._send_content(content, room_id, transaction_id)
+
+    def send_file(self, content_uri, filename, size, room_id=None, transaction_id=None):
+        if (MATRIX_CONTENT_URI.fullmatch(content_uri or '') is None
+                or MATRIX_FILE_NAME.fullmatch(filename or '') is None
+                or type(size) is not int or not 0 < size <= MAX_MATRIX_FILE_BYTES):
+            raise MatrixError('invalid_matrix_file')
+        content = {
+            'msgtype': 'm.file', 'body': filename, 'filename': filename,
+            'url': content_uri,
+            'info': {'mimetype': 'application/x-research-info-systems', 'size': size},
+        }
+        return self._send_content(content, room_id, transaction_id)
 
     def read_event(self, room_id, event_id):
         if not isinstance(room_id, str) or not room_id.startswith('!'):
@@ -311,6 +396,16 @@ class MatrixBot:
 
     def get_room_state(self, room_id):
         return self._request_array('/rooms/' + quote(room_id, safe='') + '/state')
+
+    def join_room(self, room_id):
+        if not isinstance(room_id, str) or not room_id.startswith('!'):
+            raise MatrixError('invalid_matrix_room')
+        body = self.request_json('POST', '/join/' + quote(room_id, safe=''), payload={},
+                                 idempotent=True)
+        joined = body.get('room_id') if isinstance(body, dict) else None
+        if joined != room_id:
+            raise MatrixError('matrix_join_unconfirmed')
+        return joined
 
     def direct_mapping(self):
         if not isinstance(self.user_id, str):

@@ -36,6 +36,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertNotIn('MUST-NOT-SURVIVE', result)
         self.assertNotIn('METHODENBOT_EXPERIMENT_LIVE', result)
         self.assertIn('MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM=true', result)
+        self.assertIn('MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM=true', result)
         self.assertIn('METHODENBOT_AI_DEFAULT_ENABLED=false', result)
         self.assertIn('MATRIX_CONTROL_USER=@controller:matrix.invalid', result)
         self.assertIn('MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON={}', result)
@@ -109,10 +110,24 @@ class DeploymentTests(unittest.TestCase):
             cache = root / 'deployment/__pycache__'
             cache.mkdir(parents=True)
             (cache / 'manage.pyc').write_bytes(b'generated')
-            with patch.object(manager, 'ROOT', root), patch.object(manager, 'MANIFEST', manifest):
+            with (patch.object(manager, 'ROOT', root),
+                  patch.object(manager, 'MANIFEST', manifest),
+                  patch.object(manager, 'REQUIRED_CAPABILITY_FILES', frozenset())):
                 manager.verify_bundle()
                 (root / 'unexpected.py').write_text('x')
                 with self.assertRaisesRegex(manager.DeployError, 'bundle_members_differ'):
+                    manager.verify_bundle()
+
+    def test_manifest_rejects_digest_or_multi_controller_capability_loss(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'main.py').write_text('pass\n')
+            manifest = root / 'MANIFEST.sha256'
+            manifest.write_text(hashlib.sha256(b'pass\n').hexdigest() + '  main.py\n')
+            with (patch.object(manager, 'ROOT', root),
+                  patch.object(manager, 'MANIFEST', manifest)):
+                with self.assertRaisesRegex(
+                        manager.DeployError, 'required_capability_missing'):
                     manager.verify_bundle()
 
     def test_dropin_uses_external_state_config_and_systemd_credential(self):
@@ -175,6 +190,36 @@ class DeploymentTests(unittest.TestCase):
             write.assert_not_called()
             gateway.assert_not_called()
 
+    def test_follow_release_backs_up_runtime_before_required_migration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            old, etc, backups = root / 'old', root / 'etc', root / 'backups'
+            old.mkdir()
+            self.runtime_source(old)
+            etc.mkdir()
+            runtime = etc / 'runtime.env'
+            runtime.write_bytes(manager.final_runtime_env(self.runtime_source(etc)))
+            runtime.write_text(runtime.read_text().replace(
+                'MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM=true\n', ''))
+            before_runtime = runtime.read_bytes()
+            token = etc / 'gwdg-local-token'
+            token.write_text('LOCAL-ONLY\n')
+            identity = SimpleNamespace(pw_gid=os.getgid())
+            release = Path('/srv/methodenbot-final/releases/final-one')
+            with (patch.object(manager, 'OLD', old), patch.object(manager, 'ETC', etc),
+                  patch.object(manager, 'RUNTIME_ENV', runtime),
+                  patch.object(manager, 'LOCAL_TOKEN', token),
+                  patch.object(manager, 'BACKUPS', backups),
+                  patch.object(manager, 'installed_final_release', return_value=release),
+                  patch.object(manager, 'validate_protected_file'),
+                  patch.object(manager.os, 'chown')):
+                self.assertEqual(manager.prepare_runtime_configuration(identity), release)
+            saved = list(backups.glob('runtime-env-before-stage-*'))
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0].read_bytes(), before_runtime)
+            self.assertEqual(saved[0].stat().st_mode & 0o777, 0o600)
+            self.assertIn('MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM=true', runtime.read_text())
+
     def test_follow_release_rejects_direct_key_in_canonical_runtime(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -210,6 +255,8 @@ class DeploymentTests(unittest.TestCase):
                                'MATRIX_CONSOLE_ROOM_ID=!control:x\n'
                                'MATRIX_ROOM_ID=!prod:x\n'
                                'MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON={}\n')
+            digest = state / 'digest/state.json'
+            digest.parent.mkdir(mode=0o700)
             identity = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
             waits = []
 
@@ -222,6 +269,8 @@ class DeploymentTests(unittest.TestCase):
                     'controllers_sha256': manager.control_bindings_hash(
                         '@controller:matrix.invalid', '!control:x', {})}) + '\n')
                 ready.chmod(0o600)
+                digest.write_text('{"since":"digest-cursor"}\n')
+                digest.chmod(0o600)
 
             release = Path('/srv/methodenbot-final/releases/final-one')
             with (patch.object(manager, 'STATE', state),
@@ -250,6 +299,11 @@ class DeploymentTests(unittest.TestCase):
             ready.write_text(json.dumps({
                 'version': 1, 'pid': 123, 'controllers_sha256': '0' * 64}) + '\n')
             ready.chmod(0o600)
+            digest_dir = state / 'digest'
+            digest_dir.mkdir(mode=0o700)
+            digest = digest_dir / 'state.json'
+            digest.write_text('{"since":"digest-cursor"}\n')
+            digest.chmod(0o600)
             runtime = state / 'runtime.env'
             runtime.write_text('MATRIX_CONTROL_USER=@controller:matrix.invalid\n'
                                'MATRIX_CONSOLE_ROOM_ID=!control:x\n'
@@ -263,6 +317,48 @@ class DeploymentTests(unittest.TestCase):
                     manager.wait_control_ready(
                         Path('/srv/methodenbot-final/releases/final-one'), 123, identity,
                         attempts=1, sleep=lambda _seconds: None)
+
+    def test_readiness_requires_both_controller_marker_and_digest_cursor(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            control_dir = state / 'control'
+            digest_dir = state / 'digest'
+            control_dir.mkdir(mode=0o700)
+            digest_dir.mkdir(mode=0o700)
+            control = control_dir / 'state.json'
+            control.write_text('{"since":"cursor","ai_enabled":false}\n')
+            control.chmod(0o600)
+            ready = control_dir / 'ready.json'
+            ready.write_text(json.dumps({
+                'version': 1, 'pid': 123,
+                'controllers_sha256': manager.control_bindings_hash(
+                    '@controller:matrix.invalid', '!control:x', {})}) + '\n')
+            ready.chmod(0o600)
+            digest = digest_dir / 'state.json'
+            digest.write_text('{"since":"digest-cursor"}\n')
+            digest.chmod(0o600)
+            runtime = state / 'runtime.env'
+            runtime.write_text('MATRIX_CONTROL_USER=@controller:matrix.invalid\n'
+                               'MATRIX_CONSOLE_ROOM_ID=!control:x\n'
+                               'MATRIX_ROOM_ID=!prod:x\n'
+                               'MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON={}\n')
+            identity = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+            release = Path('/srv/methodenbot-final/releases/final-one')
+
+            for missing in (ready, digest):
+                with self.subTest(missing=missing.name):
+                    raw = missing.read_bytes()
+                    missing.unlink()
+                    with (patch.object(manager, 'STATE', state),
+                          patch.object(manager, 'RUNTIME_ENV', runtime),
+                          patch.object(manager, 'service_snapshot', return_value=123)):
+                        with self.assertRaisesRegex(
+                                manager.DeployError, 'control_state_not_ready'):
+                            manager.wait_control_ready(
+                                release, 123, identity, attempts=1,
+                                sleep=lambda _seconds: None)
+                    missing.write_bytes(raw)
+                    missing.chmod(0o600)
 
     def test_restore_failure_is_explicit_and_leaves_service_stopped(self):
         restore = Mock()
