@@ -17,11 +17,18 @@ from urllib.parse import urlsplit
 from digest_bundle import (DigestBundleError, MAX_BUNDLE_BYTES, MAX_MARKDOWN_BYTES,
                            MAX_RIS_BYTES, unpack_bundle, validate_markdown, validate_ris)
 from digest_state import DigestStateError, MAX_DELIVERY_FAILURES
-from matrixbot import MAX_EVENT_CONTENT_BYTES, MatrixError, matrix_message_content
+from matrixbot import (DIGEST_FALLBACK_MARKER, MAX_EVENT_CONTENT_BYTES, MatrixError,
+                       matrix_message_content)
 
 
 logger = logging.getLogger(__name__)
 COMMANDS = {'Digest', 'Digest aus'}
+DIGEST_FALLBACK_NOTICE = (
+    'Deine bisherige persönliche Nachricht ist Ende-zu-Ende-verschlüsselt. '
+    'Dieser Methodenbot kann verschlüsselte Nachrichten nicht lesen. Bitte nutze '
+    'deshalb diesen privaten, aber nicht Ende-zu-Ende-verschlüsselten Raum und sende '
+    'hier exakt „Digest“ oder „Digest aus“.')
+MAX_FALLBACK_ROOM_SCAN = 500
 DIGEST_BUNDLE_NAME = re.compile(r'(\d{4}-\d{2}-\d{2})-methoden-digest\.bundle')
 PAIRED_CONTENT_NAME = re.compile(
     r'(\d{4}-\d{2}-\d{2})-([0-9a-f]{64})-([0-9a-f]{64})\.md')
@@ -162,9 +169,14 @@ def digest_command_from_event(event):
     if (not isinstance(event_id, str) or not event_id.startswith('$')
             or not isinstance(sender, str) or not sender.startswith('@')
             or not isinstance(content, dict)
-            or set(content) - {'msgtype', 'body', 'm.mentions'}
+            or set(content) - {
+                'msgtype', 'body', 'm.mentions', 'format', 'formatted_body'}
             or content.get('msgtype') != 'm.text'
             or content.get('m.mentions') not in (None, {})):
+        return None
+    has_format = 'format' in content or 'formatted_body' in content
+    if has_format and (content.get('format') != 'org.matrix.custom.html'
+                       or not isinstance(content.get('formatted_body'), str)):
         return None
     body = content.get('body')
     if not isinstance(body, str):
@@ -173,31 +185,102 @@ def digest_command_from_event(event):
     return (event_id, sender, command) if command in COMMANDS else None
 
 
-def validate_digest_room(bot, room_id, user_id):
+def _digest_room_state(bot, room_id, user_id, *, allow_user_invite=False,
+                       allow_missing_user=False, state=None):
     if (not isinstance(room_id, str) or not room_id.startswith('!')
             or not isinstance(user_id, str) or not user_id.startswith('@')
             or user_id == bot.user_id):
         raise DigestServiceError('invalid_digest_room_identity')
-    state = bot.get_room_state(room_id)
-    joined, singleton = set(), {}
+    if state is None:
+        state = bot.get_room_state(room_id)
+    if not isinstance(state, list) or len(state) > 20_000:
+        raise DigestServiceError('invalid_digest_room_state')
+    joined, invited, memberships, singleton = set(), set(), {}, {}
     for event in state:
-        if not isinstance(event, dict) or not isinstance(event.get('content'), dict):
+        if (not isinstance(event, dict) or not isinstance(event.get('type'), str)
+                or not isinstance(event.get('state_key'), str)
+                or not isinstance(event.get('content'), dict)):
             raise DigestServiceError('invalid_digest_room_state')
         if event.get('type') == 'm.room.encryption':
             raise DigestServiceError('encrypted_digest_room_unsupported')
         if event.get('type') == 'm.room.member':
-            if event['content'].get('membership') == 'join':
-                joined.add(event.get('state_key'))
+            membership = event['content'].get('membership')
+            memberships[event['state_key']] = membership
+            if membership in ('join', 'invite') and not event['state_key'].startswith('@'):
+                raise DigestServiceError('invalid_digest_room_state')
+            if membership == 'join':
+                joined.add(event['state_key'])
+            elif membership == 'invite':
+                invited.add(event['state_key'])
         elif event.get('state_key') == '':
-            singleton[event.get('type')] = event['content']
-    if joined != {bot.user_id, user_id}:
+            if event['type'] in singleton:
+                raise DigestServiceError('invalid_digest_room_state')
+            singleton[event['type']] = event
+    active = joined | invited
+    if allow_user_invite:
+        if (bot.user_id not in joined or joined - {bot.user_id, user_id}
+                or active - {bot.user_id, user_id}
+                or (not allow_missing_user and active != {bot.user_id, user_id})):
+            raise DigestServiceError('digest_room_not_private')
+    elif joined != {bot.user_id, user_id} or invited:
         raise DigestServiceError('digest_room_not_private')
-    if (singleton.get('m.room.join_rules', {}).get('join_rule') != 'invite'
-            or singleton.get('m.room.guest_access', {}).get('guest_access', 'forbidden') != 'forbidden'
-            or singleton.get('m.room.history_visibility', {}).get('history_visibility')
+    contents = {event_type: value['content'] for event_type, value in singleton.items()}
+    if (contents.get('m.room.join_rules', {}).get('join_rule') != 'invite'
+            or contents.get('m.room.guest_access', {}).get(
+                'guest_access', 'forbidden') != 'forbidden'
+            or contents.get('m.room.history_visibility', {}).get('history_visibility')
                == 'world_readable'):
         raise DigestServiceError('unsafe_digest_room_access')
+    return singleton, memberships
+
+
+def validate_digest_room(bot, room_id, user_id, *, state=None):
+    _digest_room_state(bot, room_id, user_id, state=state)
     return True
+
+
+def _validate_fallback_room(bot, room_id, user_id, target_sha256, *,
+                            allow_missing_user=False, state=None):
+    singleton, memberships = _digest_room_state(
+        bot, room_id, user_id, allow_user_invite=True,
+        allow_missing_user=allow_missing_user, state=state)
+    create = singleton.get('m.room.create')
+    power = singleton.get('m.room.power_levels')
+    marker = create.get('content', {}).get(DIGEST_FALLBACK_MARKER) if create else None
+    if (not create or create.get('sender') != bot.user_id
+            or marker != {'version': 1, 'target_sha256': target_sha256}
+            or not power or power.get('sender') != bot.user_id):
+        raise DigestServiceError('invalid_digest_fallback_marker')
+    levels = power['content']
+    users, events = levels.get('users', {}), levels.get('events', {})
+    if (not isinstance(users, dict) or set(users) - {bot.user_id, user_id}
+            or not isinstance(events, dict)):
+        raise DigestServiceError('unsafe_digest_fallback_power_levels')
+
+    def exact_level(value, expected):
+        return type(value) is int and value == expected
+
+    def at_least(value, minimum):
+        return type(value) is int and value >= minimum
+
+    target_level = users.get(user_id, levels.get('users_default'))
+    protected_events = {
+        'm.room.power_levels', 'm.room.encryption', 'm.room.join_rules',
+        'm.room.guest_access', 'm.room.history_visibility', 'm.room.name',
+        'm.room.topic', 'm.room.third_party_invite'}
+    state_default = levels.get('state_default')
+    tombstone = events.get('m.room.tombstone')
+    if (not exact_level(levels.get('users_default'), 0)
+            or not exact_level(levels.get('events_default'), 0)
+            or not exact_level(target_level, 0)
+            or not at_least(state_default, 100)
+            or any(not at_least(levels.get(key), 100)
+                   for key in ('invite', 'kick', 'ban', 'redact'))
+            or any(not at_least(events.get(event_type), 100)
+                   for event_type in protected_events)
+            or not at_least(tombstone, 101) or tombstone <= state_default):
+        raise DigestServiceError('unsafe_digest_fallback_power_levels')
+    return memberships
 
 
 def split_markdown(text):
@@ -318,27 +401,29 @@ class DigestService:
         self.sleep = sleep
         self.stop_event = threading.Event()
         self.inbox = Path(config.digest_inbox_dir)
+        self._startup_recovery = None
+        self._startup_joined = {}
 
     def bootstrap(self):
         if self.state.snapshot()['since'] is not None:
+            self._startup_recovery = True
             return False
         response = self.bot.sync(since=None, timeout_ms=0)
         cursor = response.get('next_batch') if isinstance(response, dict) else None
         if not isinstance(cursor, str) or not cursor:
             raise MatrixError('invalid_sync_response')
         self.state.bootstrap(cursor)
+        self._startup_recovery = False
         logger.info('Digest-DM-Empfang initialisiert; vorhandene Historie wurde nicht ausgeführt.')
         return True
 
-    def _invite_sender(self, room):
+    def _invite_details(self, room):
         invite_state = room.get('invite_state', {}) if isinstance(room, dict) else {}
         events = invite_state.get('events', []) if isinstance(invite_state, dict) else []
         if not isinstance(events, list) or len(events) > 100:
             return None
         encrypted = any(isinstance(event, dict) and event.get('type') == 'm.room.encryption'
                         for event in events)
-        if encrypted:
-            return None
         candidates = [event.get('sender') for event in events
                       if isinstance(event, dict) and event.get('type') == 'm.room.member'
                       and event.get('state_key') == self.bot.user_id
@@ -346,47 +431,173 @@ class DigestService:
                       and event['content'].get('membership') == 'invite']
         candidates = [value for value in candidates
                       if isinstance(value, str) and value.startswith('@')]
-        if not candidates:
+        candidates = set(candidates)
+        if len(candidates) != 1:
             return None
-        sender = candidates[-1]
-        joined = {event.get('state_key') for event in events
+        sender = candidates.pop()
+        if sender == self.bot.user_id:
+            return None
+        active = {event.get('state_key') for event in events
                   if isinstance(event, dict) and event.get('type') == 'm.room.member'
                   and isinstance(event.get('content'), dict)
-                  and event['content'].get('membership') == 'join'}
-        return sender if joined in (set(), {sender}) else None
+                  and event['content'].get('membership') in ('join', 'invite')}
+        return ((sender, encrypted)
+                if active - {sender, self.bot.user_id} == set() else None)
+
+    @staticmethod
+    def _target_hash(user_id):
+        return hashlib.sha256(user_id.encode('utf-8')).hexdigest()
+
+    def _existing_fallback_room(self, user_id, target_sha256):
+        subscription = self.state.snapshot()['subscriptions'].get(user_id)
+        subscription_room = (subscription.get('room_id')
+                             if isinstance(subscription, dict) else None)
+        if isinstance(subscription_room, str):
+            try:
+                validate_digest_room(self.bot, subscription_room, user_id)
+                return subscription_room, False
+            except DigestServiceError:
+                pass
+
+        room_ids = self.bot.joined_room_ids()
+        if len(room_ids) > MAX_FALLBACK_ROOM_SCAN:
+            raise DigestServiceError('too_many_rooms_for_digest_fallback')
+        safe_rooms, marked_rooms = [], []
+        for room_id in sorted(room_ids):
+            state = self.bot.get_room_state(room_id)
+            try:
+                validate_digest_room(self.bot, room_id, user_id, state=state)
+                safe_rooms.append(room_id)
+            except DigestServiceError:
+                pass
+            try:
+                _validate_fallback_room(
+                    self.bot, room_id, user_id, target_sha256,
+                    allow_missing_user=True, state=state)
+                marked_rooms.append(room_id)
+            except DigestServiceError:
+                pass
+        if safe_rooms:
+            return safe_rooms[0], False
+        if len(marked_rooms) > 1:
+            raise DigestServiceError('duplicate_digest_fallback_rooms')
+        return (marked_rooms[0], True) if marked_rooms else (None, False)
+
+    def _ensure_fallback_room(self, user_id, *, allow_create):
+        target_sha256 = self._target_hash(user_id)
+        room_id, marked = self._existing_fallback_room(user_id, target_sha256)
+        created = False
+        if room_id is None:
+            if not allow_create:
+                raise DigestServiceError('digest_fallback_create_limit')
+            # This POST is never retried blindly. On any ambiguous result the
+            # marker scan above reconciles a server-created room on the next pass.
+            room_id = self.bot.create_digest_fallback_room(user_id, target_sha256)
+            created = True
+            marked = True
+        if marked:
+            memberships = _validate_fallback_room(
+                self.bot, room_id, user_id, target_sha256,
+                allow_missing_user=True)
+            if user_id not in memberships:
+                self.bot.invite_user(room_id, user_id)
+            elif memberships[user_id] not in ('invite', 'join'):
+                raise DigestServiceError('digest_fallback_target_inactive')
+            _validate_fallback_room(self.bot, room_id, user_id, target_sha256)
+        else:
+            validate_digest_room(self.bot, room_id, user_id)
+        transaction = 'digest-e2ee-fallback-' + target_sha256[:40]
+        sent = self.bot.send_message(
+            DIGEST_FALLBACK_NOTICE, room_id=room_id, transaction_id=transaction)
+        self._verify_text(room_id, sent, DIGEST_FALLBACK_NOTICE)
+        logger.info('Unverschlüsselter privater Ersatzraum für Digest-Einladung bestätigt.')
+        return room_id, created
 
     def _join_invitations(self, response):
         rooms = response.get('rooms', {}) if isinstance(response, dict) else {}
         invited = rooms.get('invite', {}) if isinstance(rooms, dict) else {}
         if not isinstance(invited, dict) or len(invited) > 50:
             raise MatrixError('invalid_sync_response')
-        for room_id, room in invited.items():
-            sender = self._invite_sender(room)
-            if sender is None:
-                logger.warning('Digest-Einladung ignoriert: verschlüsselt oder nicht prüfbar.')
+        joined, changed, creates = [], False, 0
+        for room_id, room in sorted(invited.items()):
+            if not isinstance(room_id, str) or not room_id.startswith('!'):
+                raise MatrixError('invalid_sync_response')
+            details = self._invite_details(room)
+            if details is None:
+                logger.warning('Digest-Einladung ignoriert: Absender oder Privatraum nicht prüfbar.')
                 continue
-            try:
-                self.bot.join_room(room_id)
-                logger.info('Privater Digest-Raumeinladung beigetreten; warte auf Befehl.')
-            except MatrixError as exc:
-                logger.warning('Digest-Raumeinladung konnte nicht angenommen werden: %s', str(exc))
+            sender, encrypted = details
+            if encrypted:
+                _fallback, created = self._ensure_fallback_room(
+                    sender, allow_create=creates == 0)
+                creates += int(created)
+                changed = True
+                continue
+            self.bot.join_room(room_id)
+            joined.append((room_id, sender))
+            changed = True
+            logger.info('Privater Digest-Raumeinladung beigetreten; prüfe ersten Befehl.')
+        return joined, changed
 
-    def _commands(self, response):
+    def _commands(self, response, *, only_room_id=None):
         rooms = response.get('rooms', {}) if isinstance(response, dict) else {}
         joined = rooms.get('join', {}) if isinstance(rooms, dict) else {}
         if not isinstance(joined, dict) or len(joined) > 20_000:
             raise MatrixError('invalid_sync_response')
+        if (only_room_id is not None
+                and any(room_id != only_room_id for room_id in joined)):
+            raise MatrixError('unexpected_sync_room')
         commands = []
         for room_id, room in joined.items():
+            if only_room_id is not None and room_id != only_room_id:
+                continue
             timeline = room.get('timeline', {}) if isinstance(room, dict) else {}
             events = timeline.get('events', []) if isinstance(timeline, dict) else []
-            if not isinstance(events, list) or len(events) > 50:
+            if (not isinstance(events, list) or len(events) > 50
+                    or timeline.get('limited', False) is not False):
                 raise MatrixError('invalid_sync_response')
             for event in events:
                 command = digest_command_from_event(event)
                 if command is not None and command[1] != self.bot.user_id:
                     commands.append((room_id, *command))
         return commands
+
+    def _catch_up_joined_rooms(self, joined, *, since):
+        if not isinstance(since, str) or not since:
+            raise MatrixError('invalid_sync_cursor')
+        commands = []
+        for room_id, _sender in joined:
+            response = self.bot.sync(since=since, room_id=room_id, timeout_ms=0)
+            cursor = response.get('next_batch') if isinstance(response, dict) else None
+            if not isinstance(cursor, str) or not cursor:
+                raise MatrixError('invalid_sync_response')
+            commands.extend(self._commands(response, only_room_id=room_id))
+        for room_id, event_id, user_id, command in commands:
+            self._process_command(room_id, event_id, user_id, command)
+        return bool(commands)
+
+    def reconcile_invitations(self):
+        """Sweep current invites without replacing the persisted Digest cursor."""
+        response = self.bot.sync(since=None, timeout_ms=0)
+        cursor = response.get('next_batch') if isinstance(response, dict) else None
+        if not isinstance(cursor, str) or not cursor:
+            raise MatrixError('invalid_sync_response')
+        joined, changed = self._join_invitations(response)
+        self._startup_joined.update(joined)
+        for room_id, user_id in sorted(self._startup_joined.items()):
+            try:
+                validate_digest_room(self.bot, room_id, user_id)
+            except DigestServiceError:
+                continue
+            notice = ('Ich habe deine persönliche Digest-Einladung jetzt angenommen. '
+                      'Falls du „Digest“ oder „Digest aus“ bereits zusammen mit der '
+                      'Einladung gesendet hast, sende den Befehl bitte hier noch einmal.')
+            transaction = 'digest-invite-retry-' + _transaction(room_id)[:40]
+            sent = self.bot.send_message(
+                notice, room_id=room_id, transaction_id=transaction)
+            self._verify_text(room_id, sent, notice)
+        self._startup_joined.clear()
+        return changed
 
     def _verify_text(self, room_id, event_id, text, formatted=None):
         event = self.bot.read_event(room_id, event_id)
@@ -501,16 +712,22 @@ class DigestService:
         snapshot = self.state.snapshot()
         if snapshot['since'] is None:
             return self.bootstrap()
+        startup_changed = False
+        if self._startup_recovery is not None:
+            startup_changed = self.reconcile_invitations()
+            self._startup_recovery = None
         response = self.bot.sync(since=snapshot['since'], timeout_ms=timeout_ms)
         cursor = response.get('next_batch') if isinstance(response, dict) else None
         if not isinstance(cursor, str) or not cursor:
             raise MatrixError('invalid_sync_response')
-        self._join_invitations(response)
+        joined, invite_changed = self._join_invitations(response)
+        catch_up_changed = (self._catch_up_joined_rooms(
+            joined, since=snapshot['since']) if joined else False)
         commands = self._commands(response)
         for room_id, event_id, user_id, command in commands:
             self._process_command(room_id, event_id, user_id, command)
         self.state.advance_cursor(cursor)
-        return bool(commands)
+        return bool(commands) or startup_changed or invite_changed or catch_up_changed
 
     def _stage_inbox(self):
         try:

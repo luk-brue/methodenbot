@@ -99,18 +99,23 @@ zu werden. Änderungen erfolgen atomar und werden auf Datei und Verzeichnis sync
 ## Wöchentlicher Methoden-Journal-Digest
 
 Interessierte Personen eröffnen selbst einen privaten Raum mit dem Methodenbot und
-senden dort als reine Textnachricht exakt `Digest`. Der Bot nimmt neue prüfbare
-Raumeinladungen automatisch an, bestätigt anschließend das Abonnement und sendet sofort
-die jüngste reguläre Ausgabe einschließlich der zugehörigen RIS-Datei. `Digest aus`
-beendet das Abonnement wieder. Pro Matrix-Benutzer-ID ist genau ein Zielraum aktiv; ein
-neues `Digest` in einem anderen privaten Raum ersetzt den bisherigen Zielraum.
+senden dort als Textnachricht exakt `Digest`. Der Bot nimmt neue prüfbare
+Raumeinladungen automatisch an, holt auch einen unmittelbar mit der Einladung gesendeten
+ersten Befehl gezielt nach, bestätigt anschließend das Abonnement und sendet sofort die
+jüngste reguläre Ausgabe einschließlich der zugehörigen RIS-Datei. Matrix-Clients dürfen
+den Text standardkonform formatiert übertragen; maßgeblich bleibt der Klartextinhalt.
+`Digest aus` beendet das Abonnement wieder. Pro Matrix-Benutzer-ID ist genau ein Zielraum
+aktiv; ein neues `Digest` in einem anderen privaten Raum ersetzt den bisherigen Zielraum.
 
 Vor der Anmeldung und vor jedem Wochenversand prüft der Bot, dass ausschließlich die
 abonnierende Person und der Bot Mitglieder sind, der Raum nur per Einladung zugänglich
 und nicht öffentlich lesbar ist. Gruppenräume werden ohne öffentliche Bot-Antwort
-ignoriert. Der bestehende Matrix-Client kann keine Ende-zu-Ende-Verschlüsselung; daher
-werden verschlüsselte Einladungen nicht angenommen. Diese Grenze wird mit
-`MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM=true` bewusst freigegeben.
+ignoriert. Der bestehende Matrix-Client kann keine Ende-zu-Ende-Verschlüsselung und tritt
+verschlüsselten Räumen deshalb nie bei. Für eine eindeutige verschlüsselte Einladung
+erstellt oder findet er stattdessen einen markierten, abgesicherten und unverschlüsselten
+privaten Zweierraum. Dort erklärt er, dass `Digest` erneut gesendet werden muss; aus dem
+unlesbaren Chiffrat wird niemals automatisch ein Abonnement abgeleitet. Diese Grenze wird
+mit `MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM=true` bewusst freigegeben.
 
 Die geprüfte Datei gelangt nicht über Git oder die Exchange-Inbox in den Bot, sondern
 über einen eng begrenzten SSH-Upload:
