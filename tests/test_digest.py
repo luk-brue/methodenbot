@@ -10,19 +10,23 @@ import unittest
 from unittest.mock import patch
 
 from digest_bundle import DigestBundleError, pack_bundle, unpack_bundle
-from digest_service import (DigestService, DigestServiceError, _validate_fallback_room,
+from digest_service import (MARKDOWN_MEDIA_UPLOAD_SUFFIX, MARKDOWN_MEDIA_URI_SUFFIX,
+                            DigestService, DigestServiceError, _validate_fallback_room,
                             digest_command_from_event, markdown_to_matrix_html,
                             split_markdown)
 from digest_state import DigestState, DigestStateError
 import digest_upload_receiver
 import digest_upload
+import digest_service
 from matrixbot import (DIGEST_FALLBACK_MARKER, MAX_EVENT_CONTENT_BYTES, MatrixError,
-                       matrix_message_content)
+                       matrix_file_mimetype, matrix_message_content)
 
 
 BOT = '@methodenbot:example.org'
 USER = '@reader:example.org'
 ROOM = '!digest:example.org'
+SECOND_USER = '@second-reader:example.org'
+SECOND_ROOM = '!second-digest:example.org'
 ENCRYPTED_USER = '@encrypted-reader:example.org'
 SECOND_ENCRYPTED_USER = '@second-encrypted-reader:example.org'
 
@@ -127,6 +131,8 @@ class FakeBot:
         self.send_attempts = []
         self.file_attempts = []
         self.media_uploads = []
+        self.media_creations = 0
+        self.delivery_attempts = []
 
     def sync(self, **kwargs):
         self.sync_calls.append(copy.deepcopy(kwargs))
@@ -167,6 +173,7 @@ class FakeBot:
         return True
 
     def send_message(self, msg, room_id=None, transaction_id=None, html_msg=None, **_kwargs):
+        self.delivery_attempts.append(('text', room_id, transaction_id))
         self.send_attempts.append((room_id, transaction_id, msg, html_msg))
         if transaction_id in self.transactions:
             return self.transactions[transaction_id]
@@ -181,24 +188,32 @@ class FakeBot:
         return event_id
 
     def create_media_uri(self):
-        return 'mxc://example.org/ris' + str(len(self.media_uploads) + 1)
+        self.media_creations += 1
+        return 'mxc://example.org/media' + str(self.media_creations)
 
-    def upload_media(self, content_uri, raw, filename, **_kwargs):
-        self.media_uploads.append((content_uri, raw, filename))
+    def upload_media(self, content_uri, raw, filename, content_type=None, **_kwargs):
+        mimetype = matrix_file_mimetype(filename)
+        if mimetype is None or content_type not in (None, mimetype):
+            raise MatrixError('invalid_matrix_media')
+        self.media_uploads.append((content_uri, raw, filename, mimetype))
         return content_uri
 
     def send_file(self, content_uri, filename, size, room_id=None, transaction_id=None):
+        self.delivery_attempts.append(('file', room_id, transaction_id))
         self.file_attempts.append((room_id, transaction_id, content_uri, filename, size))
         if transaction_id in self.transactions:
             return self.transactions[transaction_id]
         event_id = '$sent-' + str(len(self.transactions) + 1)
         self.transactions[transaction_id] = event_id
+        mimetype = matrix_file_mimetype(filename)
+        if mimetype is None:
+            raise MatrixError('invalid_matrix_file')
         self.events[room_id, event_id] = {
             'event_id': event_id, 'type': 'm.room.message', 'sender': BOT,
             'content': {
                 'msgtype': 'm.file', 'body': filename, 'filename': filename,
                 'url': content_uri,
-                'info': {'mimetype': 'application/x-research-info-systems', 'size': size},
+                'info': {'mimetype': mimetype, 'size': size},
             }}
         return event_id
 
@@ -1016,7 +1031,7 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(self.state.snapshot()['since'], 's0')
         self.assertEqual(self.state.snapshot()['subscriptions'], {})
 
-    def test_digest_command_immediately_sends_latest_newsletter_and_ris(self):
+    def test_digest_command_immediately_sends_latest_newsletter_and_both_files(self):
         inbox = Path(self.config.digest_inbox_dir)
         inbox.mkdir(mode=0o700)
         markdown = b'# Methoden-Journal-Digest \xe2\x80\x93 28. August 2026\n\n**Kurzfazit**\n'
@@ -1034,9 +1049,60 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(len(self.bot.send_attempts), 2)
         self.assertIn('Digest aktiviert', self.bot.send_attempts[0][2])
         self.assertEqual(self.bot.send_attempts[1][2], markdown.decode())
-        self.assertEqual(len(self.bot.file_attempts), 1)
+        self.assertEqual(len(self.bot.file_attempts), 2)
         self.assertEqual(self.bot.file_attempts[0][3], '2026-08-28-methoden-artikel.ris')
+        self.assertEqual(self.bot.file_attempts[1][3], '2026-08-28-methoden-digest.md')
+        self.assertTrue(self.bot.file_attempts[0][1].endswith('-ris'))
+        self.assertTrue(self.bot.file_attempts[1][1].endswith('-md'))
         self.assertEqual(self.bot.media_uploads[0][1], ris)
+        self.assertEqual(self.bot.media_uploads[0][3],
+                         'application/x-research-info-systems')
+        self.assertEqual(self.bot.media_uploads[1][1], markdown)
+        self.assertEqual(self.bot.media_uploads[1][3], 'text/markdown; charset=utf-8')
+        self.assertNotEqual(self.bot.file_attempts[0][2], self.bot.file_attempts[1][2])
+        self.assertEqual([kind for kind, _room, _transaction in self.bot.delivery_attempts],
+                         ['text', 'text', 'file', 'file'])
+        self.assertTrue(self.bot.delivery_attempts[0][2].startswith('digest-command-'))
+        self.assertTrue(self.bot.delivery_attempts[1][2].endswith('-m1'))
+        self.assertTrue(self.bot.delivery_attempts[2][2].endswith('-ris'))
+        self.assertTrue(self.bot.delivery_attempts[3][2].endswith('-md'))
+
+    def test_immediate_markdown_readback_retry_reuses_media_and_transactions(self):
+        inbox = Path(self.config.digest_inbox_dir)
+        inbox.mkdir(mode=0o700)
+        markdown = b'# Methoden-Journal-Digest - 28. August 2026\n\nKurz.\n'
+        ris = b'TY  - JOUR\nTI  - Beispiel\nER  -\n'
+        source = inbox / '2026-08-28-methoden-digest.bundle'
+        source.write_bytes(pack_bundle(markdown, ris))
+        source.chmod(0o600)
+        self.service.process_inbox()
+        self.state.bootstrap('s0')
+        response = {'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {'events': [event('$subscribe-retry', 'Digest')]}}}}}
+        self.bot.sync_responses = [copy.deepcopy(response), copy.deepcopy(response)]
+        original_read = self.bot.read_event
+        failed = {'once': False}
+
+        def fail_markdown_once(room_id, event_id):
+            result = original_read(room_id, event_id)
+            if (result['content'].get('filename', '').endswith('-methoden-digest.md')
+                    and not failed['once']):
+                failed['once'] = True
+                result['content']['info']['size'] += 1
+            return result
+
+        self.bot.read_event = fail_markdown_once
+        with self.assertRaisesRegex(MatrixError, 'matrix_file_readback_mismatch'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+        self.assertNotIn('$subscribe-retry', self.state.snapshot()['completed_commands'])
+        first_markdown = self.bot.file_attempts[-1]
+        self.service.poll_once(timeout_ms=0)
+        second_markdown = self.bot.file_attempts[-1]
+        self.assertEqual(first_markdown[1:], second_markdown[1:])
+        self.assertEqual(len(self.bot.media_uploads), 2)
+        self.assertEqual(self.state.snapshot()['since'], 's1')
+        self.assertIn('$subscribe-retry', self.state.snapshot()['completed_commands'])
 
     def test_non_newsletter_digest_is_not_used_for_immediate_delivery(self):
         inbox = Path(self.config.digest_inbox_dir)
@@ -1267,9 +1333,169 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(''.join(value[2] for value in self.bot.send_attempts), markdown)
         self.assertEqual(self.bot.send_attempts[0][3],
                          '<h1>Wochenüberblick</h1><p>Eine geprüfte Zusammenfassung.</p>')
-        self.assertEqual(len(self.bot.file_attempts), 1)
+        self.assertEqual(len(self.bot.file_attempts), 2)
         self.assertEqual(self.bot.file_attempts[0][3], '2026-08-28-methoden-artikel.ris')
+        self.assertEqual(self.bot.file_attempts[1][3], '2026-08-28-methoden-digest.md')
         self.assertEqual(self.bot.media_uploads[0][1], ris.encode())
+        self.assertEqual(self.bot.media_uploads[1][1], markdown.encode())
+        self.assertEqual(self.bot.media_uploads[1][3], 'text/markdown; charset=utf-8')
+        self.assertEqual(snapshot['version'], 2)
+        self.assertEqual(len(recipient['parts']), 2)
+        for sidecar in self.state.content_directory.glob('*.matrix-markdown-*'):
+            sidecar.unlink()
+        self.bot.file_attempts.clear()
+        self.bot.media_uploads.clear()
+        DigestService(self.bot, self.config, self.state).process_inbox()
+        self.assertEqual(self.bot.file_attempts, [])
+        self.assertEqual(self.bot.media_uploads, [])
+
+    def test_weekly_markdown_retry_keeps_v2_receipts_and_reuses_event(self):
+        self.state.apply_command('$sub', 'Digest', USER, ROOM)
+        inbox = Path(self.config.digest_inbox_dir)
+        inbox.mkdir(mode=0o700)
+        markdown = b'# Wochenueberblick\n\nKurz.\n'
+        ris = b'TY  - JOUR\nTI  - Beispiel\nER  -\n'
+        source = inbox / '2026-08-28-methoden-digest.bundle'
+        source.write_bytes(pack_bundle(markdown, ris))
+        source.chmod(0o600)
+        original_read = self.bot.read_event
+        failed = {'once': False}
+
+        def fail_markdown_once(room_id, event_id):
+            result = original_read(room_id, event_id)
+            if (result['content'].get('filename', '').endswith('-methoden-digest.md')
+                    and not failed['once']):
+                failed['once'] = True
+                result['content']['url'] = 'mxc://example.org/wrong'
+            return result
+
+        self.bot.read_event = fail_markdown_once
+        self.service.process_inbox()
+        pending = self.state.snapshot()['digests']['2026-08-28']['recipients'][USER]
+        self.assertEqual(pending['status'], 'pending')
+        self.assertEqual(pending['failures'], 1)
+        self.assertTrue(all(pending['parts']))
+        self.assertEqual(len(pending['parts']), 2)
+        text_attempts = len(self.bot.send_attempts)
+        first_markdown = self.bot.file_attempts[-1]
+        DigestService(self.bot, self.config, self.state).process_inbox()
+        delivered = self.state.snapshot()['digests']['2026-08-28']['recipients'][USER]
+        self.assertEqual(delivered['status'], 'delivered')
+        self.assertEqual(len(self.bot.send_attempts), text_attempts)
+        self.assertEqual(first_markdown[1:], self.bot.file_attempts[-1][1:])
+        self.assertEqual(len(self.bot.media_uploads), 2)
+
+    def test_weekly_files_are_uploaded_once_for_multiple_recipients(self):
+        self.state.apply_command('$sub', 'Digest', USER, ROOM)
+        second_state = room_state()
+        for state_event in second_state:
+            if state_event.get('state_key') == USER:
+                state_event['state_key'] = SECOND_USER
+        self.bot.states[SECOND_ROOM] = second_state
+        self.state.apply_command('$sub-second', 'Digest', SECOND_USER, SECOND_ROOM)
+        inbox = Path(self.config.digest_inbox_dir)
+        inbox.mkdir(mode=0o700)
+        markdown = b'# Wochenueberblick\n\nKurz.\n'
+        ris = b'TY  - JOUR\nTI  - Beispiel\nER  -\n'
+        source = inbox / '2026-08-28-methoden-digest.bundle'
+        source.write_bytes(pack_bundle(markdown, ris))
+        source.chmod(0o600)
+        original_read = self.bot.read_event
+        failed = {'once': False}
+
+        def fail_first_recipient_markdown_once(room_id, event_id):
+            result = original_read(room_id, event_id)
+            if (room_id == ROOM
+                    and result['content'].get('filename', '').endswith('-methoden-digest.md')
+                    and not failed['once']):
+                failed['once'] = True
+                result['content']['info']['size'] += 1
+            return result
+
+        self.bot.read_event = fail_first_recipient_markdown_once
+        self.service.process_inbox()
+        snapshot = self.state.snapshot()['digests']['2026-08-28']
+        self.assertEqual(snapshot['recipients'][USER]['status'], 'pending')
+        self.assertEqual(snapshot['recipients'][USER]['failures'], 1)
+        self.assertEqual(snapshot['recipients'][SECOND_USER]['status'], 'delivered')
+        self.assertEqual(len(self.bot.media_uploads), 2)
+        self.assertEqual([attempt[3] for attempt in self.bot.file_attempts], [
+            '2026-08-28-methoden-artikel.ris',
+            '2026-08-28-methoden-digest.md',
+            '2026-08-28-methoden-artikel.ris',
+            '2026-08-28-methoden-digest.md',
+        ])
+        self.assertEqual(self.bot.file_attempts[0][2], self.bot.file_attempts[2][2])
+        self.assertEqual(self.bot.file_attempts[1][2], self.bot.file_attempts[3][2])
+        self.assertNotEqual(self.bot.file_attempts[0][1], self.bot.file_attempts[2][1])
+        self.assertNotEqual(self.bot.file_attempts[1][1], self.bot.file_attempts[3][1])
+        first_markdown = self.bot.file_attempts[1]
+        DigestService(self.bot, self.config, self.state).process_inbox()
+        retried = self.state.snapshot()['digests']['2026-08-28']['recipients']
+        self.assertEqual(retried[USER]['status'], 'delivered')
+        self.assertEqual(retried[SECOND_USER]['status'], 'delivered')
+        self.assertEqual(first_markdown[1:], self.bot.file_attempts[-1][1:])
+        self.assertEqual(len(self.bot.file_attempts), 5)
+        self.assertEqual(len(self.bot.media_uploads), 2)
+
+    def test_corrupt_markdown_media_sidecar_stops_before_delivery(self):
+        self.state.apply_command('$sub', 'Digest', USER, ROOM)
+        inbox = Path(self.config.digest_inbox_dir)
+        inbox.mkdir(mode=0o700)
+        source = inbox / '2026-08-28-methoden-digest.bundle'
+        source.write_bytes(pack_bundle(
+            b'# Wochenueberblick\n', b'TY  - JOUR\nTI  - Beispiel\nER  -\n'))
+        source.chmod(0o600)
+        self.service._stage_inbox()
+        digest = self.state.snapshot()['digests']['2026-08-28']
+        sidecar = (self.state.content_directory
+                   / (digest['content_file'] + MARKDOWN_MEDIA_URI_SUFFIX))
+        sidecar.write_bytes(b'not-a-content-uri\n')
+        sidecar.chmod(0o600)
+        with self.assertRaisesRegex(
+                DigestServiceError, 'invalid_digest_markdown_media'):
+            self.service._deliver()
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.bot.file_attempts, [])
+        recipient = self.state.snapshot()['digests']['2026-08-28']['recipients'][USER]
+        self.assertEqual(recipient['status'], 'pending')
+
+    def test_retry_after_markdown_upload_before_proof_reuses_media_uri(self):
+        self.state.apply_command('$sub', 'Digest', USER, ROOM)
+        inbox = Path(self.config.digest_inbox_dir)
+        inbox.mkdir(mode=0o700)
+        source = inbox / '2026-08-28-methoden-digest.bundle'
+        source.write_bytes(pack_bundle(
+            b'# Wochenueberblick\n', b'TY  - JOUR\nTI  - Beispiel\nER  -\n'))
+        source.chmod(0o600)
+        self.service._stage_inbox()
+        original_write = digest_service._atomic_private_write
+        failed = {'once': False}
+
+        def fail_proof_once(directory, name, raw):
+            if name.endswith(MARKDOWN_MEDIA_UPLOAD_SUFFIX) and not failed['once']:
+                failed['once'] = True
+                raise DigestServiceError('simulated_proof_write_failure')
+            return original_write(directory, name, raw)
+
+        with patch.object(digest_service, '_atomic_private_write', fail_proof_once):
+            with self.assertRaisesRegex(
+                    DigestServiceError, 'simulated_proof_write_failure'):
+                self.service._deliver()
+        markdown_uploads = [upload for upload in self.bot.media_uploads
+                            if upload[2].endswith('-methoden-digest.md')]
+        self.assertEqual(len(markdown_uploads), 1)
+        self.assertEqual(self.bot.file_attempts, [])
+
+        DigestService(self.bot, self.config, self.state)._deliver()
+        markdown_uploads = [upload for upload in self.bot.media_uploads
+                            if upload[2].endswith('-methoden-digest.md')]
+        self.assertEqual(len(markdown_uploads), 2)
+        self.assertEqual(markdown_uploads[0][0], markdown_uploads[1][0])
+        self.assertEqual(self.bot.media_creations, 2)
+        self.assertEqual(
+            self.state.snapshot()['digests']['2026-08-28']['recipients'][USER]['status'],
+            'delivered')
 
     def test_markdown_html_formats_digest_and_escapes_source(self):
         markdown = ('# Titel & Befund\n\n**Berichtszeitraum:** 22.–28. August  \n'
@@ -1362,6 +1588,40 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(migrated['version'], 2)
         self.assertIsNone(migrated['digests']['2026-08-28']['ris_mxc'])
         self.assertFalse(migrated['digests']['2026-08-28']['ris_uploaded'])
+
+    def test_existing_version_two_state_ignores_markdown_sidecars(self):
+        root = Path(self.directory.name) / 'existing-v2-state'
+        state = DigestState(root)
+        state.bootstrap('cursor-42')
+        state.apply_command('$sub-one', 'Digest', USER, ROOM)
+        state.apply_command('$sub-two', 'Digest', SECOND_USER, SECOND_ROOM)
+        digest_hash = 'a' * 64
+        ris_hash = 'b' * 64
+        content_file = '2026-08-28-' + digest_hash + '-' + ris_hash + '.md'
+        state.stage_digest('2026-08-28', digest_hash, content_file, 2)
+        state.record_part('2026-08-28', USER, 0, '$text-confirmed')
+        state.record_digest_media('2026-08-28', 'mxc://example.org/ris-existing')
+        state.mark_digest_media_uploaded(
+            '2026-08-28', 'mxc://example.org/ris-existing')
+        expected = state.snapshot()
+        uri_sidecar = root / 'content' / (content_file + MARKDOWN_MEDIA_URI_SUFFIX)
+        proof_sidecar = root / 'content' / (content_file + MARKDOWN_MEDIA_UPLOAD_SUFFIX)
+        uri_sidecar.write_bytes(b'mxc://example.org/markdown-existing\n')
+        proof_sidecar.write_bytes((b'c' * 64) + b'\n')
+        uri_sidecar.chmod(0o600)
+        proof_sidecar.chmod(0o600)
+
+        reopened = DigestState(root).snapshot()
+        self.assertEqual(reopened, expected)
+        self.assertEqual(reopened['version'], 2)
+        self.assertEqual(reopened['since'], 'cursor-42')
+        self.assertEqual(reopened['completed_commands'], ['$sub-one', '$sub-two'])
+        self.assertEqual(
+            reopened['digests']['2026-08-28']['recipients'][USER]['parts'],
+            ['$text-confirmed', None])
+        self.assertEqual(
+            reopened['digests']['2026-08-28']['recipients'][SECOND_USER]['parts'],
+            [None, None])
 
 
 if __name__ == '__main__':

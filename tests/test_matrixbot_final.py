@@ -80,6 +80,49 @@ class MatrixFinalTests(unittest.TestCase):
         self.assertEqual(content['url'], uri)
         self.assertEqual(content['info']['size'], len(raw))
 
+    def test_markdown_media_is_uploaded_and_sent_as_matrix_file(self):
+        api = API()
+        api.send_responses = [
+            Response(200, {}),
+            Response(200, {'event_id': '$markdown-file'}),
+        ]
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        uri = 'mxc://matrix.example.invalid/markdown123'
+        raw = b'# Methoden-Journal-Digest\n'
+        filename = '2026-08-28-methoden-digest.md'
+        self.assertEqual(bot.upload_media(uri, raw, filename), uri)
+        self.assertEqual(bot.send_file(
+            uri, filename, len(raw), transaction_id='markdown-file'), '$markdown-file')
+        self.assertEqual(api.requests[0][2]['data'], raw)
+        self.assertEqual(api.requests[0][2]['params'], {'filename': filename})
+        self.assertEqual(api.requests[0][2]['headers']['Content-Type'],
+                         'text/markdown; charset=utf-8')
+        content = api.requests[1][2]['json']
+        self.assertEqual(content, {
+            'msgtype': 'm.file', 'body': filename, 'filename': filename,
+            'url': uri,
+            'info': {'mimetype': 'text/markdown; charset=utf-8', 'size': len(raw)},
+        })
+
+    def test_matrix_files_reject_unknown_names_and_mimetype_mismatches(self):
+        bot = MatrixBot(self.config(), session_factory=API().factory,
+                        sleep=lambda seconds: None)
+        uri = 'mxc://matrix.example.invalid/file123'
+        for filename in ('digest.md', '2026-08-28-methoden-digest.txt'):
+            with self.subTest(filename=filename):
+                with self.assertRaisesRegex(MatrixError, 'invalid_matrix_media'):
+                    bot.upload_media(uri, b'data', filename)
+                with self.assertRaisesRegex(MatrixError, 'invalid_matrix_file'):
+                    bot.send_file(uri, filename, 4, transaction_id='file')
+        with self.assertRaisesRegex(MatrixError, 'invalid_matrix_media'):
+            bot.upload_media(
+                uri, b'# Digest\n', '2026-08-28-methoden-digest.md',
+                content_type='application/x-research-info-systems')
+        with self.assertRaisesRegex(MatrixError, 'invalid_matrix_media'):
+            bot.upload_media(
+                uri, b'TY  - JOUR\nER  -\n', '2026-08-28-methoden-artikel.ris',
+                content_type='text/markdown; charset=utf-8')
+
     def test_repeated_media_put_accepts_already_uploaded_response(self):
         api = API()
         api.send_responses = [Response(409, {'errcode': 'M_CANNOT_OVERWRITE_MEDIA'})]
@@ -89,6 +132,13 @@ class MatrixFinalTests(unittest.TestCase):
             'mxc://matrix.example.invalid/already', raw,
             '2026-08-28-methoden-artikel.ris'),
             'mxc://matrix.example.invalid/already')
+
+        api.send_responses = [Response(409, {'errcode': 'M_CANNOT_OVERWRITE_MEDIA'})]
+        markdown = b'# Methoden-Journal-Digest\n'
+        self.assertEqual(bot.upload_media(
+            'mxc://matrix.example.invalid/already-markdown', markdown,
+            '2026-08-28-methoden-digest.md'),
+            'mxc://matrix.example.invalid/already-markdown')
 
     def test_join_room_requires_confirmed_matching_room(self):
         api = API()

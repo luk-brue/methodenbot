@@ -6,8 +6,8 @@ Stand: 01.09.2026
 
 Diese Fassung enthält sämtliche bisherigen Parser-/Matrix-Fixes, die
 GWDG-KI-Zusammenfassung, vier persönliche Steuerbefehle für ausdrücklich
-konfigurierte Kontrollpersonen und den vollständigen Wochen-Digest mit
-Markdown-Newsletter und RIS-Datei. Der
+konfigurierte Kontrollpersonen und den vollständigen Wochen-Digest mit formatiertem
+Markdown-Newsletter sowie Markdown- und RIS-Datei zum Herunterladen. Der
 Produktionsdienst soll aus einem unveränderlichen Release unter
 `/srv/methodenbot-final/current` laufen. Zugangsdaten und Laufzeitdaten liegen
 außerhalb des Releases.
@@ -87,9 +87,11 @@ bereinigt. Eine vorhandene beschädigte oder unsichere `processed_emails.csv`
 stoppt den Dienst fail-closed; sie wird niemals als leere Historie behandelt.
 
 Digest-Abonnements und eingefrorene Wocheninhalte liegen unter
-`/var/lib/methodenbot/digest`. Der Upload-Receiver akzeptiert ausschließlich eine
-UTF-8-Datei namens `YYYY-MM-DD-methoden-digest.md` über einen separaten, per
-`authorized_keys` erzwungenen SSH-Befehl. Der Methodenbot unterstützt weiterhin keine
+`/var/lib/methodenbot/digest`. Der Upload-Receiver akzeptiert ausschließlich ein
+geprüftes Bundle aus `YYYY-MM-DD-methoden-digest.md` und
+`YYYY-MM-DD-methoden-artikel.ris` über einen separaten, per `authorized_keys`
+erzwungenen SSH-Befehl. Beide Dateien werden zusammen mit dem formatierten Digest an
+Abonnierende ausgeliefert. Der Methodenbot unterstützt weiterhin keine
 Ende-zu-Ende-Verschlüsselung; `Digest` funktioniert daher nur in unverschlüsselten
 privaten Zweier-Räumen.
 
