@@ -14,12 +14,15 @@ FILES = (
     '.env.example', 'README.md', 'UEBERGABE_LUKAS.md', 'requirements.txt',
     'main.py', 'configuration.py', 'control_state.py', 'matrixbot.py',
     'matrix_commands.py', 'manual_delivery.py', 'exchangemail.py',
+    'digest_bundle.py', 'digest_state.py', 'digest_service.py',
+    'digest_upload.py', 'digest_upload_receiver.py',
     'stats_table_manager.py', 'form_table_compat.py', 'ai_summary.py',
     'summary_selection.py', 'ai_service.py',
     'examples/quantitativ.json', 'examples/qualitativ.json', 'examples/unklar.json',
     'tests/test_ai_summary.py', 'tests/test_rate_limits.py',
     'tests/test_integration.py', 'tests/test_final_control.py',
     'tests/test_matrixbot_final.py',
+    'tests/test_digest.py', 'tests/test_combined_runtime.py',
     'tests/test_deployment.py',
     'tests/test_control_state.py',
     'tests/test_multi_control_config.py',
@@ -27,6 +30,14 @@ FILES = (
     'deployment/build_bundle.py', 'deployment/manage.py',
     'deployment/runtime_preflight.py',
 )
+
+REQUIRED_CAPABILITY_FILES = frozenset({
+    'digest_bundle.py', 'digest_service.py', 'digest_state.py',
+    'digest_upload.py', 'digest_upload_receiver.py',
+    'tests/test_digest.py', 'tests/test_combined_runtime.py',
+    'tests/test_multi_control_config.py',
+    'tests/test_multi_controller.py',
+})
 
 
 def digest(path):
@@ -42,6 +53,8 @@ def main():
     parser.add_argument('--output-dir', default='dist')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
+    if not REQUIRED_CAPABILITY_FILES.issubset(FILES):
+        raise SystemExit('Required release capability is missing')
     output = (root / args.output_dir).resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=True)
     if output == root or root not in output.parents:

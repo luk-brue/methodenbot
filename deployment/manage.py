@@ -43,6 +43,13 @@ BACKUPS = Path('/var/backups/methodenbot-final')
 MAX_ADDITIONAL_CONTROL_ROOMS = 8
 MATRIX_USER_ID = re.compile(r'@[^\s:]+:[^\s]+')
 MATRIX_ROOM_ID = re.compile(r'![^\s:]+:[^\s]+')
+REQUIRED_CAPABILITY_FILES = frozenset({
+    'digest_bundle.py', 'digest_service.py', 'digest_state.py',
+    'digest_upload.py', 'digest_upload_receiver.py',
+    'tests/test_digest.py', 'tests/test_combined_runtime.py',
+    'tests/test_multi_control_config.py',
+    'tests/test_multi_controller.py',
+})
 
 
 class DeployError(RuntimeError):
@@ -74,6 +81,8 @@ def manifest_entries():
 
 def verify_bundle():
     expected = manifest_entries()
+    if not REQUIRED_CAPABILITY_FILES.issubset(expected):
+        raise DeployError('required_capability_missing')
     actual = set()
     for path in ROOT.rglob('*'):
         if path.name == 'MANIFEST.sha256':
@@ -214,6 +223,7 @@ def final_runtime_env(source):
             additional, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
         'MATRIX_DEVICE_ID': 'METHODENBOT_FINAL_2026_08',
         'MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM': 'true',
+        'MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM': 'true',
         'METHODENBOT_AI_ENABLED': 'true',
         'METHODENBOT_AI_DEFAULT_ENABLED': 'false',
         'GWDG_DATA_TRANSFER_APPROVED': 'true',
@@ -222,11 +232,16 @@ def final_runtime_env(source):
     removed = set(managed) | {
         'GWDG_API_KEY', 'GWDG_API_KEY_FILE', 'METHODENBOT_EXPERIMENT_LIVE',
         'MATRIX_ALLOW_UNENCRYPTED_TEST_DM', 'METHODENBOT_STATE_DIR',
-        'METHODENBOT_ENV_FILE', 'MATRIX_TOKEN_FILE'}
+        'METHODENBOT_ENV_FILE', 'MATRIX_TOKEN_FILE',
+        'MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM'}
     key_pattern = re.compile(r'^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=')
+    marker = '# Methodenbot final: zentral verwaltete Werte'
     kept = [line for line in lines
-            if not ((match := key_pattern.match(line)) and match.group(1) in removed)]
-    kept.extend(['', '# Methodenbot final: zentral verwaltete Werte',
+            if line.strip() != marker
+            and not ((match := key_pattern.match(line)) and match.group(1) in removed)]
+    while kept and not kept[-1].strip():
+        kept.pop()
+    kept.extend(['', marker,
                  *(key + '=' + value for key, value in managed.items())])
     values = env_values(kept)
     required = ('UK_NUMMER', 'EMAIL_ADDRESS', 'EMAIL_PASSWORD', 'EWS_ENDPOINT',
@@ -334,6 +349,7 @@ def validate_existing_runtime(identity):
     expected = {
         'MATRIX_DEVICE_ID': 'METHODENBOT_FINAL_2026_08',
         'MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM': 'true',
+        'MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM': 'true',
         'METHODENBOT_AI_ENABLED': 'true',
         'METHODENBOT_AI_DEFAULT_ENABLED': 'false',
         'GWDG_DATA_TRANSFER_APPROVED': 'true',
@@ -357,6 +373,16 @@ def validate_existing_runtime(identity):
         raise DeployError('local_token_invalid')
 
 
+def backup_runtime_before_stage():
+    """Keep the exact pre-migration configuration for manual recovery only."""
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    BACKUPS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(BACKUPS, 0o700)
+    backup = BACKUPS / ('runtime-env-before-stage-' + stamp + '-' + uuid.uuid4().hex[:8])
+    atomic_write(backup, RUNTIME_ENV.read_bytes(), 0o600)
+    return backup
+
+
 def prepare_runtime_configuration(identity):
     """Initialize secrets once; follow-up releases preserve canonical values."""
     existing = installed_final_release()
@@ -364,6 +390,13 @@ def prepare_runtime_configuration(identity):
     os.chown(ETC, 0, identity.pw_gid)
     os.chmod(ETC, 0o750)
     if existing is not None:
+        validate_protected_file(RUNTIME_ENV, mode=0o640, uid=0, gid=identity.pw_gid)
+        validate_protected_file(LOCAL_TOKEN, mode=0o600, uid=0, gid=0)
+        migrated = final_runtime_env(RUNTIME_ENV)
+        if migrated != RUNTIME_ENV.read_bytes():
+            backup = backup_runtime_before_stage()
+            atomic_write(RUNTIME_ENV, migrated, 0o640, 0, identity.pw_gid)
+            print('configuration_backup=' + backup.name)
         validate_existing_runtime(identity)
         return existing
     atomic_write(RUNTIME_ENV, final_runtime_env(OLD / '.env'), 0o640, 0, identity.pw_gid)
@@ -611,9 +644,10 @@ def verify_service(expected_release, *, attempts=20, stable_seconds=5, sleep=tim
 
 
 def wait_control_ready(expected_release, expected_pid, identity, *, attempts=90, sleep=time.sleep):
-    """Wait for the synchronous Matrix bootstrap without accepting a PID restart."""
+    """Wait for every control poller and the digest cursor without accepting a restart."""
     control_file = STATE / 'control/state.json'
     ready_file = STATE / 'control/ready.json'
+    digest_file = STATE / 'digest/state.json'
     try:
         runtime_values = env_values(RUNTIME_ENV.read_text(encoding='utf-8').splitlines())
         control_user = runtime_values.get('MATRIX_CONTROL_USER', '')
@@ -634,15 +668,20 @@ def wait_control_ready(expected_release, expected_pid, identity, *, attempts=90,
                                     uid=identity.pw_uid, gid=identity.pw_gid)
             validate_protected_file(ready_file, mode=0o600,
                                     uid=identity.pw_uid, gid=identity.pw_gid)
+            validate_protected_file(digest_file, mode=0o600,
+                                    uid=identity.pw_uid, gid=identity.pw_gid)
         except DeployError as exc:
             if str(exc) != 'protected_runtime_file_missing':
                 raise
         else:
             try:
-                if control_file.stat().st_size > 2_000_000 or ready_file.stat().st_size > 4096:
+                if (control_file.stat().st_size > 2_000_000
+                        or ready_file.stat().st_size > 4096
+                        or digest_file.stat().st_size > 4_000_000):
                     raise DeployError('control_state_invalid')
                 control = json.loads(control_file.read_text(encoding='utf-8'))
                 ready = json.loads(ready_file.read_text(encoding='utf-8'))
+                digest = json.loads(digest_file.read_text(encoding='utf-8'))
             except DeployError:
                 raise
             except (OSError, UnicodeError, ValueError, RecursionError):
@@ -652,9 +691,12 @@ def wait_control_ready(expected_release, expected_pid, identity, *, attempts=90,
                     or not isinstance(ready, dict)
                     or set(ready) != {'version', 'pid', 'controllers_sha256'}
                     or ready.get('version') != 1 or ready.get('pid') != expected_pid
-                    or ready.get('controllers_sha256') != expected_hash):
+                    or ready.get('controllers_sha256') != expected_hash
+                    or not isinstance(digest, dict)
+                    or digest.get('since') is not None and not isinstance(digest.get('since'), str)):
                 raise DeployError('control_state_invalid')
-            if isinstance(control.get('since'), str) and control['since']:
+            if (isinstance(control.get('since'), str) and control['since']
+                    and isinstance(digest.get('since'), str) and digest['since']):
                 return control
         if attempt + 1 < attempts:
             sleep(1)

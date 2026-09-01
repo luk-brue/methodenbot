@@ -48,6 +48,58 @@ class API:
 
 
 class MatrixFinalTests(unittest.TestCase):
+    @staticmethod
+    def config():
+        return SimpleNamespace(matrix_server='https://matrix.example.invalid',
+                               matrix_user='@bot:example.invalid', matrix_password='secret',
+                               matrix_room_id='!room:example.invalid', matrix_device_id='STABLE')
+
+    def test_ris_media_is_created_uploaded_and_sent_as_matrix_file(self):
+        api = API()
+        api.send_responses = [
+            Response(200, {'content_uri': 'mxc://matrix.example.invalid/ris123'}),
+            Response(200, {}),
+            Response(200, {'event_id': '$file'}),
+        ]
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        uri = bot.create_media_uri()
+        raw = b'TY  - JOUR\nTI  - Beispiel\nER  -\n'
+        filename = '2026-08-28-methoden-artikel.ris'
+        self.assertEqual(bot.upload_media(uri, raw, filename), uri)
+        self.assertEqual(bot.send_file(
+            uri, filename, len(raw), transaction_id='ris-file'), '$file')
+        self.assertEqual(api.requests[0][0:2], (
+            'POST', 'https://matrix.example.invalid/_matrix/media/v1/create'))
+        self.assertIn('/_matrix/media/v3/upload/matrix.example.invalid/ris123',
+                      api.requests[1][1])
+        self.assertEqual(api.requests[1][2]['data'], raw)
+        self.assertEqual(api.requests[1][2]['headers']['Content-Type'],
+                         'application/x-research-info-systems')
+        content = api.requests[2][2]['json']
+        self.assertEqual(content['msgtype'], 'm.file')
+        self.assertEqual(content['url'], uri)
+        self.assertEqual(content['info']['size'], len(raw))
+
+    def test_repeated_media_put_accepts_already_uploaded_response(self):
+        api = API()
+        api.send_responses = [Response(409, {'errcode': 'M_CANNOT_OVERWRITE_MEDIA'})]
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        raw = b'TY  - JOUR\nTI  - Beispiel\nER  -\n'
+        self.assertEqual(bot.upload_media(
+            'mxc://matrix.example.invalid/already', raw,
+            '2026-08-28-methoden-artikel.ris'),
+            'mxc://matrix.example.invalid/already')
+
+    def test_join_room_requires_confirmed_matching_room(self):
+        api = API()
+        api.send_responses = [Response(200, {'room_id': '!private:example.invalid'})]
+        config = SimpleNamespace(matrix_server='https://matrix.example.invalid',
+                                 matrix_user='@bot:example.invalid', matrix_password='secret',
+                                 matrix_room_id='!room:example.invalid', matrix_device_id='STABLE')
+        bot = MatrixBot(config, session_factory=api.factory, sleep=lambda seconds: None)
+        self.assertEqual(bot.join_room('!private:example.invalid'), '!private:example.invalid')
+        self.assertTrue(api.requests[-1][1].endswith('/join/%21private%3Aexample.invalid'))
+
     def test_401_refresh_uses_new_header_and_identical_transaction_url(self):
         api = API()
         config = SimpleNamespace(matrix_server='https://matrix.example.invalid',

@@ -254,6 +254,7 @@ class IntegrationTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), patch('configuration.load_dotenv') as dotenv:
             config = Configuration()
         self.assertFalse(config.allow_unencrypted_control_dm)
+        self.assertFalse(config.allow_unencrypted_digest_dm)
         self.assertFalse(config.ai.enabled)
         self.assertFalse(config.ai.transfer_approved)
         self.assertIsNone(config.matrix_control_user)
@@ -282,6 +283,19 @@ class IntegrationTests(unittest.TestCase):
         config.matrix_control_user = 'not-a-matrix-user'
         config.allow_unencrypted_control_dm = True
         with self.assertRaisesRegex(RuntimeError, 'keine gültige Matrix-Benutzer-ID'):
+            config.validate_final_runtime()
+
+    def test_digest_dm_consent_is_required_by_final_validation(self):
+        config = Configuration.__new__(Configuration)
+        for name in ('uk_nummer', 'email_address', 'email_password', 'ews_endpoint', 'matrix_server',
+                     'matrix_user', 'matrix_password', 'matrix_room_id', 'matrix_console_room_id',
+                     'google_form_link'):
+            setattr(config, name, 'https://matrix.invalid' if name == 'matrix_server' else 'value')
+        config.matrix_room_id, config.matrix_console_room_id = '!prod:x', '!control:x'
+        config.matrix_control_user = '@controller:example.org'
+        config.allow_unencrypted_control_dm = True
+        config.allow_unencrypted_digest_dm = False
+        with self.assertRaisesRegex(RuntimeError, 'Digest-PNs'):
             config.validate_final_runtime()
 
 

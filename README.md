@@ -1,8 +1,10 @@
 # Methodenbot – finale Fassung
 
-Stand: 31.08.2026. Diese Arbeitskopie verbindet den bisherigen produktiven
+Stand: 01.09.2026. Diese Arbeitskopie verbindet den bisherigen produktiven
 Methodenbot mit der getesteten GWDG-KI-Zusammenfassung und einer explizit
-freigegebenen persönlichen Matrix-Steuerung für mehrere Verantwortliche.
+freigegebenen persönlichen Matrix-Steuerung für mehrere Verantwortliche. Sie
+enthält außerdem den vollständigen Wochen-Digest mit Markdown-Newsletter und
+RIS-Datei.
 
 ## Verhalten
 
@@ -94,6 +96,62 @@ Auch `processed_emails.csv` ist ein fail-closed Zustelljournal: vorhandene besch
 unsichere oder unlesbare Dateien stoppen den Dienst, statt als leere Liste interpretiert
 zu werden. Änderungen erfolgen atomar und werden auf Datei und Verzeichnis synchronisiert.
 
+## Wöchentlicher Methoden-Journal-Digest
+
+Interessierte Personen eröffnen selbst einen privaten Raum mit dem Methodenbot und
+senden dort als reine Textnachricht exakt `Digest`. Der Bot nimmt neue prüfbare
+Raumeinladungen automatisch an, bestätigt anschließend das Abonnement und sendet sofort
+die jüngste reguläre Ausgabe einschließlich der zugehörigen RIS-Datei. `Digest aus`
+beendet das Abonnement wieder. Pro Matrix-Benutzer-ID ist genau ein Zielraum aktiv; ein
+neues `Digest` in einem anderen privaten Raum ersetzt den bisherigen Zielraum.
+
+Vor der Anmeldung und vor jedem Wochenversand prüft der Bot, dass ausschließlich die
+abonnierende Person und der Bot Mitglieder sind, der Raum nur per Einladung zugänglich
+und nicht öffentlich lesbar ist. Gruppenräume werden ohne öffentliche Bot-Antwort
+ignoriert. Der bestehende Matrix-Client kann keine Ende-zu-Ende-Verschlüsselung; daher
+werden verschlüsselte Einladungen nicht angenommen. Diese Grenze wird mit
+`MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM=true` bewusst freigegeben.
+
+Die geprüfte Datei gelangt nicht über Git oder die Exchange-Inbox in den Bot, sondern
+über einen eng begrenzten SSH-Upload:
+
+1. Die Freitags-Automation erzeugt und prüft lokal
+   `YYYY-MM-DD-methoden-digest.md` und `YYYY-MM-DD-methoden-artikel.ris`.
+2. `digest_upload.py` validiert zusammengehörige Dateinamen, Größen, UTF-8 und die
+   RIS-Datensatzgrenzen, bildet ein längengeprüftes gemeinsames Bundle, berechnet
+   SHA-256 und überträgt die Bytes über einen dedizierten SSH-Config-Alias.
+3. Der öffentliche Schlüssel dieses Uploaders erhält serverseitig ausschließlich den
+   erzwungenen Befehl `digest_upload_receiver.py`; Shell, PTY und Weiterleitungen
+   bleiben durch die OpenSSH-Option `restrict` gesperrt.
+4. Der Receiver bestätigt nur ein atomar und mit passendem Hash unter
+   `/var/lib/methodenbot/digest/inbox/` gespeichertes Bundle. Erst danach meldet der
+   lokale Uploader Erfolg.
+5. Der laufende Bot friert Inhalte, Empfängerliste und Hashes geschützt ein, sendet
+   Markdown als formatierte, größenbegrenzte Matrix-Nachrichten und RIS als
+   herunterladbare Datei. Stabile Matrix-Transaktions-IDs, persistente Medien-URIs und
+   Readback verhindern sichtbare Doppelzustellungen nach einem Neustart.
+
+Beispiel für den lokalen Aufruf nach erfolgreicher Digest-Prüfung:
+
+```sh
+python3 digest_upload.py \
+  --target methodenbot-digest-upload \
+  /Users/fscharf/Downloads/Methoden-Journal-Digest/YYYY-MM-DD-methoden-digest.md \
+  /Users/fscharf/Downloads/Methoden-Journal-Digest/YYYY-MM-DD-methoden-artikel.ris
+```
+
+Der SSH-Alias enthält Host, Benutzer und den Pfad zu einem eigenen Upload-Schlüssel;
+er enthält keine Schlüsselwerte im Repository. Der passende `authorized_keys`-Eintrag
+muss durch eine Serveradministration einmalig mit einem absoluten Python- und
+Releasepfad eingerichtet werden, sinngemäß:
+
+```text
+restrict,command="/home/methodenbot/methodenbot/venv/bin/python -B /srv/methodenbot-final/current/digest_upload_receiver.py" ssh-ed25519 PUBLIC_KEY_NUR_FUER_DIGEST_UPLOAD
+```
+
+Gleicher Lauf-Tag mit anderem Hash wird absichtlich fail-closed abgelehnt: Eine bereits
+begonnene Wochenzustellung wird nicht still durch geänderten Inhalt ersetzt.
+
 ## Laufzeitpfade
 
 - Code: `/srv/methodenbot-final/releases/<release>/`
@@ -102,6 +160,8 @@ zu werden. Änderungen erfolgen atomar und werden auf Datei und Verzeichnis sync
 - lokaler Gateway-Token: systemd-Credential `gwdg-local-token`
 - verarbeitete IDs, Statistik, Matrix-Sitzung und Kontrollzustand:
   `/var/lib/methodenbot/`
+- Digest-Abonnements, Zustelljournal, eingefrorene Inhalte und Upload-Eingang:
+  `/var/lib/methodenbot/digest/`
 - bestehende virtuelle Umgebung: `/home/methodenbot/methodenbot/venv`
 
 Der Releasebaum enthält keine `.env`, CSV, Logs, Token oder Schlüssel.
@@ -130,7 +190,10 @@ sudo env METHODENBOT_DEPLOY_HOST="$METHODENBOT_DEPLOY_HOST" METHODENBOT_DEPLOY_A
   python3 deployment/manage.py activate --confirm-restart
 ```
 
-`stage` verändert den laufenden Dienst nicht. `live-preflight` liest Matrix-Raum,
+`stage` verändert den laufenden Dienst nicht. Falls dabei eine kanonische
+`runtime.env` um neue verwaltete Einstellungen ergänzt werden muss, wird vorher
+eine rootgeschützte, unveränderte Kopie unter `/var/backups/methodenbot-final/`
+angelegt. `live-preflight` liest Matrix-Raum,
 Gateway-Modellliste und die letzten drei Exchange-Anfragen, sendet aber nichts.
 Erst `activate` stoppt den bestehenden Dienst kurz, legt ein rootgeschütztes
 Backup an, migriert CSVs und setzt das systemd-Drop-in. Ein Fehler während der
@@ -141,7 +204,15 @@ ausgegebene Backupname kann zusätzlich nur in der dazu passenden aktiven Releas
 für `rollback --backup NAME --confirm-restart` verwendet werden. Folgereleases
 bewahren die kanonische `runtime.env`, den lokalen Token, CSVs und den globalen
 KI-Schalter. Die Aktivierung gilt erst als bereit, wenn alle konfigurierten
-Raumpoller derselben stabilen Dienst-PID initialisiert wurden.
+Raumpoller derselben stabilen Dienst-PID und zusätzlich der Digest-Poller mit
+einem gültigen Cursor initialisiert wurden. Beim Bauen und Prüfen eines Releases
+verhindert eine feste Capability-Liste, dass Digest- oder Mehrraum-Dateien
+unbemerkt fehlen.
+
+Der persistente Zustandsbaum unter `/var/lib/methodenbot/` wird bei einem
+Final-zu-Final-Rollback absichtlich nicht zurückgespielt: Er enthält monotone
+Zustellbelege; ein älterer Stand könnte bereits bestätigte Mail- oder
+Digest-Zustellungen vergessen und dadurch Duplikate verursachen.
 
 ## Tests
 
@@ -158,6 +229,9 @@ Mehrraum-Polling, globale Toggle-Reihenfolge, falsche/unsichere Räume, Zielräu
 für `Test`/`Test 2`, KI-aus ohne Modellaufruf,
 Matrix-401-Reauthentifizierung samt persistiertem Token, echte Zustandsneustarts,
 Crash-Idempotenz, begrenzte Zustellfehler, globale Mailauswahl und fail-closed CSV-Zustand.
+Ein kombinierter Runtime-Test prüft zusätzlich, dass mehrere Kontrollraumpoller,
+der einzelne serielle Befehls-Worker und der Digest-Dienst gemeinsam gestartet,
+initialisiert und beendet werden.
 
 ## Noch nicht durch Offline-Tests bewiesen
 
