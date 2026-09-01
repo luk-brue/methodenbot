@@ -95,12 +95,30 @@ def event(identity, body, *, sender=USER, extra=None):
             'content': content}
 
 
+def paged_event(identity, body, *, room_id=ROOM, sender=USER, extra=None):
+    result = event(identity, body, sender=sender, extra=extra)
+    result['room_id'] = room_id
+    return result
+
+
+def membership_event(identity, *, sender, membership, room_id=ROOM,
+                     state_key=BOT):
+    return {
+        'room_id': room_id, 'event_id': identity, 'type': 'm.room.member',
+        'state_key': state_key, 'sender': sender,
+        'content': {'membership': membership},
+    }
+
+
 class FakeBot:
     def __init__(self):
         self.user_id = BOT
         self.states = {ROOM: room_state()}
         self.sync_responses = []
         self.sync_calls = []
+        self.room_message_responses = []
+        self.room_message_calls = []
+        self.state_calls = []
         self.joined = []
         self.created_rooms = []
         self.invited_users = []
@@ -117,11 +135,19 @@ class FakeBot:
             raise response
         return copy.deepcopy(response)
 
+    def room_messages(self, room_id, **kwargs):
+        self.room_message_calls.append((room_id, copy.deepcopy(kwargs)))
+        response = self.room_message_responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return copy.deepcopy(response)
+
     def join_room(self, room_id):
         self.joined.append(room_id)
         return room_id
 
     def get_room_state(self, room_id):
+        self.state_calls.append(room_id)
         return copy.deepcopy(self.states[room_id])
 
     def joined_room_ids(self):
@@ -269,7 +295,7 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(self.state.snapshot()['since'], 's0')
         self.assertEqual(self.state.snapshot()['subscriptions'], {})
 
-    def test_limited_join_catch_up_keeps_original_cursor(self):
+    def test_limited_join_catch_up_closes_gap_and_advances_original_cursor(self):
         self.state.bootstrap('s0')
         invited = '!invite-limited:example.org'
         self.bot.states[invited] = room_state()
@@ -279,10 +305,713 @@ class DigestTests(unittest.TestCase):
                     {'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
                      'content': {'membership': 'invite'}}]}}}}},
             {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'state': {'events': [{
+                    'event_id': '$bot-join', 'type': 'm.room.member',
+                    'state_key': BOT, 'sender': BOT,
+                    'content': {'membership': 'join'},
+                }]},
                 'timeline': {'limited': True,
-                             'events': [event('$possibly-incomplete', 'Digest')]}}}}},
+                             'prev_batch': 'p-before-visible',
+                             'events': [event('$unsubscribe', 'Digest aus')]}}}}},
         ]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-empty',
+             'chunk': [
+                 membership_event(
+                     '$bot-invite', sender=USER, membership='invite',
+                     room_id=invited),
+                 membership_event(
+                     '$bot-join', sender=BOT, membership='join',
+                     room_id=invited),
+                 paged_event('$subscribe-gap', 'Digest', room_id=invited),
+             ]},
+            {'start': 'p-empty', 'end': 'p-before-visible', 'chunk': []},
+        ]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.state.snapshot()['since'], 's1')
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+        self.assertEqual(self.bot.room_message_calls, [
+            (invited, {'from_token': 's0', 'to_token': 'p-before-visible', 'limit': 50}),
+            (invited, {'from_token': 'p-empty', 'to_token': 'p-before-visible', 'limit': 50}),
+        ])
+        self.assertIn('Digest aktiviert', self.bot.send_attempts[0][2])
+        self.assertIn('Digest deaktiviert', self.bot.send_attempts[1][2])
+
+    def test_limited_join_catch_up_state_join_allows_visible_command(self):
+        self.state.bootstrap('s0')
+        invited = '!invite-state-join-visible:example.org'
+        self.bot.states[invited] = room_state()
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: {
+                'invite_state': {'events': [{
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]}}}}},
+            {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'state': {'events': [{
+                    'event_id': '$state-visible-join',
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': BOT,
+                    'content': {'membership': 'join'},
+                }]},
+                'timeline': {
+                    'limited': True, 'prev_batch': 'p-visible',
+                    'events': [event('$state-visible-command', 'Digest')],
+                },
+            }}}},
+        ]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-visible', 'chunk': []}]
+        self.service.poll_once(timeout_ms=0)
+        snapshot = self.state.snapshot()
+        self.assertEqual(snapshot['since'], 's1')
+        self.assertEqual(
+            snapshot['subscriptions'][USER]['event_id'],
+            '$state-visible-command')
+
+    def test_limited_join_catch_up_state_invite_alone_rejects_visible_command(self):
+        self.state.bootstrap('s0')
+        invited = '!invite-state-invite-only:example.org'
+        self.bot.states[invited] = room_state()
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: {
+                'invite_state': {'events': [{
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]}}}}},
+            {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'state': {'events': [{
+                    'event_id': '$state-only-invite',
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]},
+                'timeline': {
+                    'limited': True, 'prev_batch': 'p-visible',
+                    'events': [event('$unsafe-visible-command', 'Digest')],
+                },
+            }}}},
+        ]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-visible', 'chunk': []}]
+        with self.assertRaisesRegex(
+                MatrixError, 'digest_command_before_join_boundary'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_limited_join_catch_up_accepts_expected_invite_join_gap_boundary(self):
+        self.state.bootstrap('s0')
+        invited = '!invite-gap-boundary:example.org'
+        self.bot.states[invited] = room_state()
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: {
+                'invite_state': {'events': [{
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]}}}}},
+            {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'timeline': {
+                    'limited': True, 'prev_batch': 'p-visible', 'events': [],
+                },
+            }}}},
+        ]
+        self.bot.room_message_responses = [{
+            'start': 's0', 'end': 'p-visible', 'chunk': [
+                membership_event(
+                    '$expected-invite', sender=USER, membership='invite',
+                    room_id=invited),
+                membership_event(
+                    '$expected-self-join', sender=BOT, membership='join',
+                    room_id=invited),
+                paged_event('$expected-command', 'Digest', room_id=invited),
+            ],
+        }]
+        self.service.poll_once(timeout_ms=0)
+        snapshot = self.state.snapshot()
+        self.assertEqual(snapshot['since'], 's1')
+        self.assertEqual(
+            snapshot['subscriptions'][USER]['event_id'], '$expected-command')
+        self.assertEqual(len(self.bot.send_attempts), 1)
+
+    def test_limited_join_catch_up_accepts_exact_state_and_gap_boundary_duplicate(self):
+        self.state.bootstrap('s0')
+        invited = '!invite-duplicate-boundary:example.org'
+        self.bot.states[invited] = room_state()
+        state_join = membership_event(
+            '$duplicate-self-join', sender=BOT, membership='join',
+            room_id=invited)
+        state_join.pop('room_id')
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: {
+                'invite_state': {'events': [{
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]}}}}},
+            {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'state': {'events': [state_join]},
+                'timeline': {
+                    'limited': True, 'prev_batch': 'p-visible', 'events': [],
+                },
+            }}}},
+        ]
+        self.bot.room_message_responses = [{
+            'start': 's0', 'end': 'p-visible', 'chunk': [
+                membership_event(
+                    '$duplicate-invite', sender=USER, membership='invite',
+                    room_id=invited),
+                membership_event(
+                    '$duplicate-self-join', sender=BOT, membership='join',
+                    room_id=invited),
+                paged_event('$duplicate-command', 'Digest', room_id=invited),
+            ],
+        }]
+        self.service.poll_once(timeout_ms=0)
+        snapshot = self.state.snapshot()
+        self.assertEqual(snapshot['since'], 's1')
+        self.assertEqual(
+            snapshot['subscriptions'][USER]['event_id'], '$duplicate-command')
+        self.assertEqual(len(self.bot.send_attempts), 1)
+
+    def test_limited_join_catch_up_rejects_command_before_duplicated_boundary(self):
+        self.state.bootstrap('s0')
+        invited = '!invite-history-replay:example.org'
+        self.bot.states[invited] = room_state()
+        state_invite = membership_event(
+            '$replay-invite', sender=USER, membership='invite',
+            room_id=invited)
+        state_join = membership_event(
+            '$replay-self-join', sender=BOT, membership='join',
+            room_id=invited)
+        state_invite.pop('room_id')
+        state_join.pop('room_id')
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: {
+                'invite_state': {'events': [{
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]}}}}},
+            {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'state': {'events': [state_invite, state_join]},
+                'timeline': {
+                    'limited': True, 'prev_batch': 'p-visible', 'events': [],
+                },
+            }}}},
+        ]
+        self.bot.room_message_responses = [{
+            'start': 's0', 'end': 'p-visible', 'chunk': [
+                paged_event('$pre-invite-command', 'Digest', room_id=invited),
+                membership_event(
+                    '$replay-invite', sender=USER, membership='invite',
+                    room_id=invited),
+                membership_event(
+                    '$replay-self-join', sender=BOT, membership='join',
+                    room_id=invited),
+            ],
+        }]
+        with self.assertRaisesRegex(
+                MatrixError, 'digest_security_state_changed_in_gap'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_limited_join_catch_up_rejects_state_timeline_event_id_conflict(self):
+        self.state.bootstrap('s0')
+        invited = '!invite-state-id-conflict:example.org'
+        self.bot.states[invited] = room_state()
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: {
+                'invite_state': {'events': [{
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]}}}}},
+            {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'state': {'events': [{
+                    'event_id': '$state-command-conflict',
+                    'type': 'm.room.topic', 'state_key': '', 'sender': USER,
+                    'content': {'topic': 'Legitimate state update'},
+                }, {
+                    'event_id': '$state-conflict-self-join',
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': BOT,
+                    'content': {'membership': 'join'},
+                }]},
+                'timeline': {
+                    'limited': True, 'prev_batch': 'p-visible', 'events': [],
+                },
+            }}}},
+        ]
+        self.bot.room_message_responses = [{
+            'start': 's0', 'end': 'p-visible',
+            'chunk': [
+                membership_event(
+                    '$state-conflict-self-join', sender=BOT,
+                    membership='join', room_id=invited),
+                paged_event(
+                    '$state-command-conflict', 'Digest', room_id=invited),
+            ],
+        }]
+        with self.assertRaisesRegex(MatrixError, 'conflicting_matrix_event'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_limited_join_catch_up_rejects_invite_from_wrong_sender(self):
+        self.state.bootstrap('s0')
+        invited = '!invite-wrong-sender:example.org'
+        wrong = '@wrong-inviter:example.org'
+        self.bot.states[invited] = room_state()
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: {
+                'invite_state': {'events': [{
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]}}}}},
+            {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'timeline': {
+                    'limited': True, 'prev_batch': 'p-visible', 'events': [],
+                },
+            }}}},
+        ]
+        self.bot.room_message_responses = [{
+            'start': 's0', 'end': 'p-visible', 'chunk': [
+                membership_event(
+                    '$wrong-invite', sender=wrong, membership='invite',
+                    room_id=invited),
+                membership_event(
+                    '$wrong-invite-self-join', sender=BOT, membership='join',
+                    room_id=invited),
+                paged_event('$wrong-invite-command', 'Digest', room_id=invited),
+            ],
+        }]
+        with self.assertRaisesRegex(
+                MatrixError, 'digest_security_state_changed_in_gap'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_limited_join_catch_up_rejects_additional_member_transition(self):
+        self.state.bootstrap('s0')
+        invited = '!invite-extra-member:example.org'
+        extra = '@extra:example.org'
+        self.bot.states[invited] = room_state()
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: {
+                'invite_state': {'events': [{
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]}}}}},
+            {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'timeline': {
+                    'limited': True, 'prev_batch': 'p-visible', 'events': [],
+                },
+            }}}},
+        ]
+        self.bot.room_message_responses = [{
+            'start': 's0', 'end': 'p-visible', 'chunk': [
+                membership_event(
+                    '$extra-invite', sender=USER, membership='invite',
+                    room_id=invited),
+                membership_event(
+                    '$extra-self-join', sender=BOT, membership='join',
+                    room_id=invited),
+                membership_event(
+                    '$extra-member', sender=extra, membership='join',
+                    room_id=invited, state_key=extra),
+                paged_event('$extra-command', 'Digest', room_id=invited),
+            ],
+        }]
+        with self.assertRaisesRegex(
+                MatrixError, 'digest_security_state_changed_in_gap'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_limited_join_catch_up_rejects_nonboundary_security_transition(self):
+        self.state.bootstrap('s0')
+        invited = '!invite-limited-unsafe:example.org'
+        self.bot.states[invited] = room_state()
+        bot_join = {
+            'event_id': '$late-bot-join', 'type': 'm.room.member',
+            'state_key': BOT, 'sender': BOT,
+            'content': {'membership': 'join'},
+        }
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: {
+                'invite_state': {'events': [{
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]}}}}},
+            {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'timeline': {
+                    'limited': True, 'prev_batch': 'p-visible',
+                    'events': [event('$command-before-join', 'Digest'), bot_join],
+                },
+            }}}},
+        ]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-visible', 'chunk': []}]
+        with self.assertRaisesRegex(
+                MatrixError, 'digest_security_state_changed_in_gap'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_poll_request_budget_is_shared_by_catch_up_and_global_gap(self):
+        self.state.bootstrap('s0')
+        invited = '!invite-budget:example.org'
+        later = '!later-budget:example.org'
+        self.bot.states[invited] = room_state()
+        self.bot.states[later] = room_state()
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {
+                'invite': {invited: {'invite_state': {'events': [{
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]}}},
+                'join': {later: {'timeline': {
+                    'limited': True, 'prev_batch': 'p-later', 'events': []}}},
+            }},
+            {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'state': {'events': [{
+                    'event_id': '$budget-bot-join', 'type': 'm.room.member',
+                    'state_key': BOT, 'sender': BOT,
+                    'content': {'membership': 'join'},
+                }]},
+                'timeline': {
+                    'limited': True, 'prev_batch': 'p-invited',
+                    'events': [event('$caught-before-budget', 'Digest')],
+                },
+            }}}},
+        ]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-invited', 'chunk': []}]
+        with patch('digest_service.MAX_DIGEST_GAP_REQUESTS_PER_POLL', 2):
+            with self.assertRaisesRegex(
+                    MatrixError, 'digest_gap_poll_budget_exceeded'):
+                self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.state_calls, [invited])
+        self.assertEqual(len(self.bot.room_message_calls), 1)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_poll_gap_event_budget_is_shared_across_rooms(self):
+        self.state.bootstrap('s0')
+        second = '!second-gap-budget:example.org'
+        self.bot.states[second] = room_state()
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {
+            ROOM: {'timeline': {
+                'limited': True, 'prev_batch': 'p-one', 'events': []}},
+            second: {'timeline': {
+                'limited': True, 'prev_batch': 'p-two', 'events': []}},
+        }}}]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-one',
+             'chunk': [paged_event('$budget-one', 'hello')]},
+            {'start': 's0', 'end': 'p-two',
+             'chunk': [paged_event('$budget-two', 'hello', room_id=second)]},
+        ]
+        with patch('digest_service.MAX_DIGEST_GAP_EVENTS_PER_POLL', 1):
+            with self.assertRaisesRegex(
+                    MatrixError, 'digest_gap_poll_budget_exceeded'):
+                self.service.poll_once(timeout_ms=0)
+        self.assertEqual(len(self.bot.room_message_calls), 2)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_poll_event_id_registry_is_bounded_across_rooms(self):
+        self.state.bootstrap('s0')
+        second = '!second-registry-budget:example.org'
+        self.bot.states[second] = room_state()
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {
+            ROOM: {'timeline': {'events': [event('$registry-one', 'hello')]}},
+            second: {'timeline': {'events': [event('$registry-two', 'hello')]}},
+        }}}]
+        with patch('digest_service.MAX_DIGEST_EVENT_IDS_PER_POLL', 1):
+            with self.assertRaisesRegex(
+                    MatrixError, 'digest_gap_poll_budget_exceeded'):
+                self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_limited_group_room_does_not_block_digest_dm_or_cursor(self):
+        self.state.bootstrap('s0')
+        group = '!busy-group:example.org'
+        self.bot.states[group] = room_state(extra='@third:example.org')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {
+            group: {'timeline': {'limited': True, 'events': []}},
+            ROOM: {'timeline': {'events': [event('$subscribe', 'Digest')]}}
+        }}}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.state.snapshot()['subscriptions'][USER]['room_id'], ROOM)
+        self.assertEqual(self.state.snapshot()['since'], 's1')
+        self.assertIn('Digest aktiviert', self.bot.send_attempts[-1][2])
+
+    def test_limited_digest_dm_closes_multipage_gap_in_chronological_order(self):
+        self.state.bootstrap('s0')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {'limited': True,
+                         'prev_batch': 'p-before-visible',
+                         'events': [event('$visible-on', 'Digest')]}
+        }}}}]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-mid',
+             'chunk': [paged_event('$gap-on', 'Digest')]},
+            {'start': 'p-mid', 'end': 'p-before-visible',
+             'chunk': [paged_event('$gap-off', 'Digest aus')]},
+        ]
+        self.service.poll_once(timeout_ms=0)
+        snapshot = self.state.snapshot()
+        self.assertEqual(snapshot['since'], 's1')
+        self.assertEqual(snapshot['subscriptions'][USER]['event_id'], '$visible-on')
+        self.assertEqual([
+            'deaktiviert' if 'deaktiviert' in attempt[2] else 'aktiviert'
+            for attempt in self.bot.send_attempts],
+            ['aktiviert', 'deaktiviert', 'aktiviert'])
+
+    def test_limited_digest_dm_without_prev_batch_remains_fail_closed(self):
+        self.state.bootstrap('s0')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {'limited': True, 'events': [event('$visible', 'Digest')]}
+        }}}}]
         with self.assertRaisesRegex(MatrixError, 'invalid_sync_response'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+        self.assertEqual(self.bot.send_attempts, [])
+
+    def test_limited_digest_dm_aborts_before_other_room_side_effects(self):
+        self.state.bootstrap('s0')
+        second_room = '!second-digest:example.org'
+        self.bot.states[second_room] = room_state()
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {
+            ROOM: {'timeline': {'events': [event('$would-subscribe', 'Digest')]}},
+            second_room: {'timeline': {
+                'limited': True, 'prev_batch': 'p-gap', 'events': []}},
+        }}}]
+        self.bot.room_message_responses = [MatrixError('matrix_network_error')]
+        with self.assertRaisesRegex(MatrixError, 'matrix_network_error'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+
+    def test_limited_gap_is_fully_fetched_before_any_command_side_effect(self):
+        self.state.bootstrap('s0')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {
+                'limited': True, 'prev_batch': 'p-final', 'events': []}
+        }}}}]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-mid',
+             'chunk': [paged_event('$would-subscribe', 'Digest')]},
+            MatrixError('matrix_network_error'),
+        ]
+        with self.assertRaisesRegex(MatrixError, 'matrix_network_error'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+
+    def test_later_global_gap_error_prevents_invite_catch_up_command_side_effect(self):
+        self.state.bootstrap('s0')
+        invited = '!invite-before-error:example.org'
+        later = '!later-limited:example.org'
+        self.bot.states[invited] = room_state()
+        self.bot.states[later] = room_state()
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {
+                'invite': {invited: {'invite_state': {'events': [{
+                    'type': 'm.room.member', 'state_key': BOT, 'sender': USER,
+                    'content': {'membership': 'invite'},
+                }]}}},
+                'join': {later: {'timeline': {
+                    'limited': True, 'prev_batch': 'p-later', 'events': []}}},
+            }},
+            {'next_batch': 'catch-up', 'rooms': {'join': {invited: {
+                'timeline': {'events': [event('$caught-up', 'Digest')]}
+            }}}},
+        ]
+        self.bot.room_message_responses = [MatrixError('matrix_network_error')]
+        with self.assertRaisesRegex(MatrixError, 'matrix_network_error'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.joined, [invited])
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+
+    def test_security_state_event_in_limited_gap_keeps_cursor(self):
+        self.state.bootstrap('s0')
+        membership = {
+            'room_id': ROOM, 'event_id': '$member-gap', 'type': 'm.room.member',
+            'sender': USER, 'state_key': USER,
+            'content': {'membership': 'join', 'displayname': 'Changed'},
+        }
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {
+                'limited': True, 'prev_batch': 'p-final',
+                'events': [event('$visible-command', 'Digest')]}
+        }}}}]
+        self.bot.room_message_responses = [{
+            'start': 's0', 'end': 'p-final', 'chunk': [membership]}]
+        with self.assertRaisesRegex(
+                MatrixError, 'digest_security_state_changed_in_gap'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_security_state_event_in_visible_limited_timeline_keeps_cursor(self):
+        self.state.bootstrap('s0')
+        join_rules = {
+            'event_id': '$join-rules-visible', 'type': 'm.room.join_rules',
+            'sender': USER, 'state_key': '', 'content': {'join_rule': 'invite'},
+        }
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {
+                'limited': True, 'prev_batch': 'p-final',
+                'events': [join_rules, event('$visible-command', 'Digest')]}
+        }}}}]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-final', 'chunk': []}]
+        with self.assertRaisesRegex(
+                MatrixError, 'digest_security_state_changed_in_gap'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_security_state_delta_for_limited_timeline_keeps_cursor(self):
+        self.state.bootstrap('s0')
+        power = {
+            'event_id': '$power-gap', 'type': 'm.room.power_levels',
+            'sender': BOT, 'state_key': '', 'content': {'users_default': 0},
+        }
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'state': {'events': [power]},
+            'timeline': {
+                'limited': True, 'prev_batch': 'p-final',
+                'events': [event('$visible-command', 'Digest')]}
+        }}}}]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-final', 'chunk': []}]
+        with self.assertRaisesRegex(
+                MatrixError, 'digest_security_state_changed_in_gap'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_security_state_delta_without_digest_candidate_does_not_block_other_room(self):
+        self.state.bootstrap('s0')
+        other = '!other-digest:example.org'
+        self.bot.states[other] = room_state()
+        membership = {
+            'event_id': '$fallback-member', 'type': 'm.room.member',
+            'sender': BOT, 'state_key': BOT, 'content': {'membership': 'join'},
+        }
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {
+            ROOM: {
+                'state': {'events': [membership]},
+                'timeline': {
+                    'limited': True, 'prev_batch': 'p-final', 'events': []},
+            },
+            other: {'timeline': {'events': [event('$other-subscribe', 'Digest')]}},
+        }}}]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-final', 'chunk': []}]
+        self.service.poll_once(timeout_ms=0)
+        snapshot = self.state.snapshot()
+        self.assertEqual(snapshot['since'], 's1')
+        self.assertEqual(snapshot['subscriptions'][USER]['room_id'], other)
+        self.assertEqual(len(self.bot.send_attempts), 1)
+
+    def test_limited_gap_without_end_is_a_complete_bounded_range(self):
+        self.state.bootstrap('s0')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {
+                'limited': True, 'prev_batch': 'p-final', 'events': []}
+        }}}}]
+        self.bot.room_message_responses = [{
+            'start': 's0', 'chunk': [paged_event('$subscribe', 'Digest')]}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.state.snapshot()['since'], 's1')
+        self.assertEqual(
+            self.state.snapshot()['subscriptions'][USER]['event_id'], '$subscribe')
+
+    def test_gap_and_visible_duplicate_event_is_processed_once(self):
+        self.state.bootstrap('s0')
+        duplicate = event('$duplicate', 'Digest')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {'limited': True, 'prev_batch': 'p-final',
+                         'events': [duplicate]}
+        }}}}]
+        self.bot.room_message_responses = [{
+            'start': 's0', 'end': 'p-final',
+            'chunk': [paged_event('$duplicate', 'Digest')]}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(len(self.bot.send_attempts), 1)
+        self.assertEqual(self.state.snapshot()['since'], 's1')
+
+    def test_conflicting_duplicate_event_keeps_cursor_and_sends_nothing(self):
+        self.state.bootstrap('s0')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {'limited': True, 'prev_batch': 'p-final',
+                         'events': [event('$duplicate', 'Digest aus')]}
+        }}}}]
+        self.bot.room_message_responses = [{
+            'start': 's0', 'end': 'p-final',
+            'chunk': [paged_event('$duplicate', 'Digest')]}]
+        with self.assertRaisesRegex(MatrixError, 'conflicting_matrix_event'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_gap_pagination_token_cycle_keeps_cursor(self):
+        self.state.bootstrap('s0')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {
+                'limited': True, 'prev_batch': 'p-final', 'events': []}
+        }}}}]
+        self.bot.room_message_responses = [
+            {'start': 's0', 'end': 'p-mid', 'chunk': []},
+            {'start': 'p-mid', 'end': 's0', 'chunk': []},
+        ]
+        with self.assertRaisesRegex(MatrixError, 'invalid_matrix_messages_response'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_gap_pagination_page_bound_keeps_cursor(self):
+        self.state.bootstrap('s0')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {
+                'limited': True, 'prev_batch': 'p-final', 'events': []}
+        }}}}]
+        self.bot.room_message_responses = [
+            {'start': 's0' if index == 0 else 'p' + str(index),
+             'end': 'p' + str(index + 1), 'chunk': []}
+            for index in range(40)]
+        with self.assertRaisesRegex(MatrixError, 'digest_gap_too_large'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(len(self.bot.room_message_calls), 40)
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+    def test_limited_encrypted_room_is_safely_skipped(self):
+        self.state.bootstrap('s0')
+        encrypted = '!encrypted-legacy:example.org'
+        self.bot.states[encrypted] = room_state(encrypted=True)
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {
+            encrypted: {'timeline': {'limited': True, 'events': []}},
+        }}}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.state.snapshot()['since'], 's1')
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+
+    def test_limited_room_with_unknown_state_remains_fail_closed(self):
+        self.state.bootstrap('s0')
+        unknown = '!unknown-state:example.org'
+        self.bot.states[unknown] = [
+            {'type': 'm.room.member', 'state_key': BOT, 'content': {}}]
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {unknown: {
+            'timeline': {'limited': True, 'events': []}
+        }}}}]
+        with self.assertRaisesRegex(MatrixError, 'invalid_digest_room_state'):
             self.service.poll_once(timeout_ms=0)
         self.assertEqual(self.state.snapshot()['since'], 's0')
         self.assertEqual(self.state.snapshot()['subscriptions'], {})

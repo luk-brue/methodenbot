@@ -3,6 +3,7 @@
 from datetime import date as Date
 import hashlib
 import html
+import json
 import logging
 import os
 from pathlib import Path
@@ -16,7 +17,8 @@ from urllib.parse import urlsplit
 
 from digest_bundle import (DigestBundleError, MAX_BUNDLE_BYTES, MAX_MARKDOWN_BYTES,
                            MAX_RIS_BYTES, unpack_bundle, validate_markdown, validate_ris)
-from digest_state import DigestStateError, MAX_DELIVERY_FAILURES
+from digest_state import (DigestStateError, MAX_COMPLETED_COMMANDS,
+                          MAX_DELIVERY_FAILURES)
 from matrixbot import (DIGEST_FALLBACK_MARKER, MAX_EVENT_CONTENT_BYTES, MatrixError,
                        matrix_message_content)
 
@@ -29,6 +31,23 @@ DIGEST_FALLBACK_NOTICE = (
     'deshalb diesen privaten, aber nicht Ende-zu-Ende-verschlüsselten Raum und sende '
     'hier exakt „Digest“ oder „Digest aus“.')
 MAX_FALLBACK_ROOM_SCAN = 500
+DIGEST_GAP_PAGE_LIMIT = 50
+MAX_DIGEST_GAP_PAGES = 40
+MAX_DIGEST_GAP_EVENTS = DIGEST_GAP_PAGE_LIMIT * MAX_DIGEST_GAP_PAGES
+MAX_DIGEST_GAP_REQUESTS_PER_POLL = 100
+MAX_DIGEST_GAP_EVENTS_PER_POLL = 2000
+MAX_DIGEST_EVENT_IDS_PER_POLL = 10_000
+DIGEST_SECURITY_STATE_EVENTS = {
+    'm.room.member',
+    'm.room.encryption',
+    'm.room.join_rules',
+    'm.room.guest_access',
+    'm.room.history_visibility',
+    'm.room.power_levels',
+    'm.room.third_party_invite',
+    'm.room.create',
+    'm.room.tombstone',
+}
 DIGEST_BUNDLE_NAME = re.compile(r'(\d{4}-\d{2}-\d{2})-methoden-digest\.bundle')
 PAIRED_CONTENT_NAME = re.compile(
     r'(\d{4}-\d{2}-\d{2})-([0-9a-f]{64})-([0-9a-f]{64})\.md')
@@ -237,6 +256,212 @@ def _digest_room_state(bot, room_id, user_id, *, allow_user_invite=False,
 def validate_digest_room(bot, room_id, user_id, *, state=None):
     _digest_room_state(bot, room_id, user_id, state=state)
     return True
+
+
+def _limited_room_definitely_not_digest(bot, room_id):
+    """Return true only when current state rules out a valid Digest DM.
+
+    A limited global sync timeline can omit an earlier command.  It is safe to
+    advance past that room only when the complete current state proves that the
+    command would be rejected by ``validate_digest_room`` anyway.  Malformed or
+    internally inconsistent state remains fail-closed.
+    """
+    state = bot.get_room_state(room_id)
+    if not isinstance(state, list) or len(state) > 20_000:
+        raise MatrixError('invalid_digest_room_state')
+    joined, invited, seen = set(), set(), set()
+    allowed_memberships = {'ban', 'invite', 'join', 'knock', 'leave'}
+    for event in state:
+        if (not isinstance(event, dict) or not isinstance(event.get('type'), str)
+                or not isinstance(event.get('state_key'), str)
+                or not isinstance(event.get('content'), dict)):
+            raise MatrixError('invalid_digest_room_state')
+        identity = (event['type'], event['state_key'])
+        if identity in seen:
+            raise MatrixError('invalid_digest_room_state')
+        seen.add(identity)
+        if event['type'] != 'm.room.member':
+            continue
+        membership = event['content'].get('membership')
+        if (not isinstance(membership, str) or membership not in allowed_memberships
+                or not event['state_key'].startswith('@')):
+            raise MatrixError('invalid_digest_room_state')
+        if membership == 'join':
+            joined.add(event['state_key'])
+        elif membership == 'invite':
+            invited.add(event['state_key'])
+    if bot.user_id not in joined:
+        raise MatrixError('inconsistent_digest_room_state')
+    peers = joined - {bot.user_id}
+    if len(peers) != 1 or invited:
+        return True
+    user_id = next(iter(peers))
+    try:
+        validate_digest_room(bot, room_id, user_id, state=state)
+    except DigestServiceError as exc:
+        if str(exc) in {
+                'encrypted_digest_room_unsupported',
+                'digest_room_not_private',
+                'unsafe_digest_room_access'}:
+            return True
+        raise MatrixError('invalid_digest_room_state') from None
+    return False
+
+
+def _validated_timeline_event(event, room_id, *, require_room_id=False):
+    if (not isinstance(event, dict)
+            or not isinstance(event.get('event_id'), str)
+            or not event['event_id'].startswith('$')
+            or len(event['event_id']) > 1024
+            or not isinstance(event.get('type'), str) or not event['type']
+            or not isinstance(event.get('sender'), str)
+            or not event['sender'].startswith('@')
+            or not isinstance(event.get('content'), dict)
+            or ('state_key' in event and not isinstance(event['state_key'], str))
+            or (event.get('type') in DIGEST_SECURITY_STATE_EVENTS
+                and 'state_key' not in event)
+            or (require_room_id and event.get('room_id') != room_id)
+            or ('room_id' in event and event['room_id'] != room_id)):
+        raise MatrixError('invalid_matrix_timeline_event')
+    core = {
+        'type': event['type'],
+        'sender': event['sender'],
+        'content': event['content'],
+        'has_state_key': 'state_key' in event,
+        'state_key': event.get('state_key'),
+    }
+    try:
+        fingerprint = json.dumps(
+            core, ensure_ascii=True, allow_nan=False, sort_keys=True,
+            separators=(',', ':'))
+    except (TypeError, ValueError, RecursionError):
+        raise MatrixError('invalid_matrix_timeline_event') from None
+    return event['event_id'], fingerprint
+
+
+def _bot_join_event(event, bot_user_id):
+    return (event.get('type') == 'm.room.member'
+            and event.get('state_key') == bot_user_id
+            and event.get('sender') == bot_user_id
+            and event.get('content', {}).get('membership') == 'join')
+
+
+def _bot_invite_event(event, bot_user_id, expected_inviter):
+    return (event.get('type') == 'm.room.member'
+            and event.get('state_key') == bot_user_id
+            and event.get('sender') == expected_inviter
+            and event.get('content', {}).get('membership') == 'invite')
+
+
+def _targeted_join_boundary_events(
+        state_events, ordered_events, *, room_id, bot_user_id,
+        expected_inviter):
+    """Return source-scoped invite/join transitions safe for catch-up."""
+    allowed_state, allowed_ordered, transitions = {}, {}, {}
+    state_join_confirmed = False
+
+    def remember(event, kind, target):
+        event_id, fingerprint = _validated_timeline_event(event, room_id)
+        previous = target.get(event_id)
+        if previous is not None and previous != fingerprint:
+            raise MatrixError('conflicting_matrix_event')
+        previous_transition = transitions.get(kind)
+        if (previous_transition is not None
+                and previous_transition != (event_id, fingerprint)):
+            return False
+        target[event_id] = fingerprint
+        transitions[kind] = (event_id, fingerprint)
+        return True
+
+    # ``state`` precedes the returned timeline.  It can contain the membership
+    # delta at the timeline boundary.  The same events can also occur in the
+    # paginated gap, so state confirms exact transitions without consuming the
+    # chronological gap phase.
+    for event in state_events:
+        if _bot_invite_event(event, bot_user_id, expected_inviter):
+            remember(event, 'invite', allowed_state)
+        elif _bot_join_event(event, bot_user_id):
+            state_join_confirmed = (
+                remember(event, 'join', allowed_state)
+                or state_join_confirmed)
+
+    # Membership transitions in the chronological gap/timeline must form its
+    # leading boundary: invite by the validated inviter, then the bot's join.
+    phase = 'before_invite'
+    ordered_join_index = None
+    for index, event in enumerate(ordered_events):
+        if event.get('type') not in DIGEST_SECURITY_STATE_EVENTS:
+            break
+        if (_bot_invite_event(event, bot_user_id, expected_inviter)
+                and phase == 'before_invite'):
+            accepted = remember(event, 'invite', allowed_ordered)
+            phase = 'invited'
+        elif (_bot_join_event(event, bot_user_id)
+              and phase in ('before_invite', 'invited')):
+            accepted = remember(event, 'join', allowed_ordered)
+            phase = 'joined'
+            if accepted:
+                ordered_join_index = index
+        else:
+            accepted = False
+        if not accepted:
+            break
+    return (allowed_state, allowed_ordered, state_join_confirmed,
+            ordered_join_index)
+
+
+def _reject_digest_security_state_events(
+        events, *, room_id, allowed_security_events=None):
+    allowed_security_events = allowed_security_events or {}
+    for event in events:
+        if event.get('type') not in DIGEST_SECURITY_STATE_EVENTS:
+            continue
+        event_id, fingerprint = _validated_timeline_event(event, room_id)
+        if allowed_security_events.get(event_id) == fingerprint:
+            continue
+        raise MatrixError('digest_security_state_changed_in_gap')
+
+
+def _consume_gap_budget(budget, field, amount, limit):
+    if budget is None:
+        return
+    value = budget.get(field)
+    if type(value) is not int or value < 0 or type(amount) is not int or amount < 0:
+        raise MatrixError('invalid_digest_gap_budget')
+    value += amount
+    if value > limit:
+        raise MatrixError('digest_gap_poll_budget_exceeded')
+    budget[field] = value
+
+
+def _remember_matrix_event(seen_events, event, room_id):
+    event_id, fingerprint = _validated_timeline_event(event, room_id)
+    identity = (room_id, fingerprint)
+    previous = seen_events.get(event_id)
+    if previous is not None:
+        if previous != identity:
+            raise MatrixError('conflicting_matrix_event')
+        return event_id, False
+    if len(seen_events) >= MAX_DIGEST_EVENT_IDS_PER_POLL:
+        raise MatrixError('digest_gap_poll_budget_exceeded')
+    seen_events[event_id] = identity
+    return event_id, True
+
+
+def _dedupe_commands(commands):
+    result, seen = [], {}
+    for command in commands:
+        event_id = command[1]
+        previous = seen.get(event_id)
+        if previous is not None:
+            if previous != command:
+                raise MatrixError('conflicting_matrix_event')
+            continue
+        seen[event_id] = command
+        result.append(command)
+    if len(result) > MAX_COMPLETED_COMMANDS:
+        raise MatrixError('too_many_digest_commands')
+    return result
 
 
 def _validate_fallback_room(bot, room_id, user_id, target_sha256, *,
@@ -539,7 +764,47 @@ class DigestService:
             logger.info('Privater Digest-Raumeinladung beigetreten; prüfe ersten Befehl.')
         return joined, changed
 
-    def _commands(self, response, *, only_room_id=None):
+    def _gap_events(self, room_id, *, since, to_token, gap_budget=None):
+        if (not isinstance(since, str) or not since
+                or not isinstance(to_token, str) or not to_token):
+            raise MatrixError('invalid_sync_cursor')
+        if since == to_token:
+            return []
+        events, token, seen_tokens = [], since, {since}
+        for _page_index in range(MAX_DIGEST_GAP_PAGES):
+            _consume_gap_budget(
+                gap_budget, 'requests', 1, MAX_DIGEST_GAP_REQUESTS_PER_POLL)
+            page = self.bot.room_messages(
+                room_id, from_token=token, to_token=to_token,
+                limit=DIGEST_GAP_PAGE_LIMIT)
+            chunk = page.get('chunk') if isinstance(page, dict) else None
+            start = page.get('start') if isinstance(page, dict) else None
+            if (not isinstance(chunk, list)
+                    or len(chunk) > DIGEST_GAP_PAGE_LIMIT or start != token):
+                raise MatrixError('invalid_matrix_messages_response')
+            for event in chunk:
+                _validated_timeline_event(event, room_id, require_room_id=True)
+            _consume_gap_budget(
+                gap_budget, 'events', len(chunk), MAX_DIGEST_GAP_EVENTS_PER_POLL)
+            events.extend(chunk)
+            if len(events) > MAX_DIGEST_GAP_EVENTS:
+                raise MatrixError('digest_gap_too_large')
+            if 'end' not in page:
+                return events
+            end = page['end']
+            if (not isinstance(end, str) or not end or len(end) > 8192
+                    or end in seen_tokens):
+                raise MatrixError('invalid_matrix_messages_response')
+            if end == to_token:
+                return events
+            seen_tokens.add(end)
+            token = end
+        raise MatrixError('digest_gap_too_large')
+
+    def _commands(self, response, *, since, only_room_id=None,
+                  expected_inviter=None, seen_events=None, gap_budget=None):
+        if not isinstance(since, str) or not since:
+            raise MatrixError('invalid_sync_cursor')
         rooms = response.get('rooms', {}) if isinstance(response, dict) else {}
         joined = rooms.get('join', {}) if isinstance(rooms, dict) else {}
         if not isinstance(joined, dict) or len(joined) > 20_000:
@@ -547,34 +812,121 @@ class DigestService:
         if (only_room_id is not None
                 and any(room_id != only_room_id for room_id in joined)):
             raise MatrixError('unexpected_sync_room')
+        if ((only_room_id is None) != (expected_inviter is None)
+                or (expected_inviter is not None
+                    and (not isinstance(expected_inviter, str)
+                         or not expected_inviter.startswith('@')
+                         or expected_inviter == self.bot.user_id))):
+            raise MatrixError('invalid_sync_response')
         commands = []
+        if seen_events is None:
+            seen_events = {}
+        if gap_budget is None:
+            gap_budget = {'requests': 0, 'events': 0}
         for room_id, room in joined.items():
             if only_room_id is not None and room_id != only_room_id:
                 continue
-            timeline = room.get('timeline', {}) if isinstance(room, dict) else {}
-            events = timeline.get('events', []) if isinstance(timeline, dict) else []
-            if (not isinstance(events, list) or len(events) > 50
-                    or timeline.get('limited', False) is not False):
+            if not isinstance(room_id, str) or not room_id.startswith('!'):
                 raise MatrixError('invalid_sync_response')
+            timeline = room.get('timeline', {}) if isinstance(room, dict) else None
+            events = timeline.get('events', []) if isinstance(timeline, dict) else None
+            limited = timeline.get('limited', False) if isinstance(timeline, dict) else None
+            if (not isinstance(events, list) or len(events) > 50
+                    or type(limited) is not bool):
+                raise MatrixError('invalid_sync_response')
+            if limited:
+                _consume_gap_budget(
+                    gap_budget, 'requests', 1,
+                    MAX_DIGEST_GAP_REQUESTS_PER_POLL)
+                if _limited_room_definitely_not_digest(self.bot, room_id):
+                    logger.warning(
+                        'Begrenzte Timeline eines eindeutig ungeeigneten '
+                        'Digest-Raums übersprungen.')
+                    continue
+                previous = timeline.get('prev_batch')
+                if not isinstance(previous, str) or not previous:
+                    raise MatrixError('invalid_sync_response')
+                room_state = room.get('state', {}) if isinstance(room, dict) else None
+                state_events = (room_state.get('events', [])
+                                if isinstance(room_state, dict) else None)
+                if not isinstance(state_events, list) or len(state_events) > 20_000:
+                    raise MatrixError('invalid_sync_response')
+                gap_events = self._gap_events(
+                    room_id, since=since, to_token=previous,
+                    gap_budget=gap_budget)
+                for state_event in state_events:
+                    if (not isinstance(state_event, dict)
+                            or 'state_key' not in state_event):
+                        raise MatrixError('invalid_sync_response')
+                    _validated_timeline_event(state_event, room_id)
+                for timeline_event in gap_events + events:
+                    _validated_timeline_event(timeline_event, room_id)
+                has_digest_candidate = any(
+                    command is not None and command[1] != self.bot.user_id
+                    for command in map(
+                        digest_command_from_event, gap_events + events))
+                if has_digest_candidate:
+                    (allowed_state_events, allowed_ordered_events,
+                     state_join_confirmed, ordered_join_index) = (
+                        _targeted_join_boundary_events(
+                            state_events, gap_events + events,
+                            room_id=room_id, bot_user_id=self.bot.user_id,
+                            expected_inviter=expected_inviter)
+                        if only_room_id is not None
+                        else ({}, {}, False, None))
+                    _reject_digest_security_state_events(
+                        state_events,
+                        room_id=room_id,
+                        allowed_security_events=allowed_state_events)
+                    _reject_digest_security_state_events(
+                        gap_events + events,
+                        room_id=room_id,
+                        allowed_security_events=allowed_ordered_events)
+                    if only_room_id is not None:
+                        ordered_events = gap_events + events
+                        for index, ordered_event in enumerate(ordered_events):
+                            command = digest_command_from_event(ordered_event)
+                            if (command is None
+                                    or command[1] == self.bot.user_id):
+                                continue
+                            if index < len(gap_events):
+                                after_join = (ordered_join_index is not None
+                                              and ordered_join_index < index)
+                            else:
+                                after_join = (state_join_confirmed
+                                              or (ordered_join_index is not None
+                                                  and ordered_join_index < index))
+                            if not after_join:
+                                raise MatrixError(
+                                    'digest_command_before_join_boundary')
+                for state_event in state_events:
+                    _remember_matrix_event(seen_events, state_event, room_id)
+                events = gap_events + events
             for event in events:
+                event_id, first_seen = _remember_matrix_event(
+                    seen_events, event, room_id)
+                if not first_seen:
+                    continue
                 command = digest_command_from_event(event)
                 if command is not None and command[1] != self.bot.user_id:
                     commands.append((room_id, *command))
-        return commands
+        return _dedupe_commands(commands)
 
-    def _catch_up_joined_rooms(self, joined, *, since):
+    def _catch_up_joined_rooms(
+            self, joined, *, since, seen_events, gap_budget):
         if not isinstance(since, str) or not since:
             raise MatrixError('invalid_sync_cursor')
         commands = []
-        for room_id, _sender in joined:
+        for room_id, sender in joined:
             response = self.bot.sync(since=since, room_id=room_id, timeout_ms=0)
             cursor = response.get('next_batch') if isinstance(response, dict) else None
             if not isinstance(cursor, str) or not cursor:
                 raise MatrixError('invalid_sync_response')
-            commands.extend(self._commands(response, only_room_id=room_id))
-        for room_id, event_id, user_id, command in commands:
-            self._process_command(room_id, event_id, user_id, command)
-        return bool(commands)
+            commands.extend(self._commands(
+                response, since=since, only_room_id=room_id,
+                expected_inviter=sender, seen_events=seen_events,
+                gap_budget=gap_budget))
+        return _dedupe_commands(commands)
 
     def reconcile_invitations(self):
         """Sweep current invites without replacing the persisted Digest cursor."""
@@ -721,13 +1073,20 @@ class DigestService:
         if not isinstance(cursor, str) or not cursor:
             raise MatrixError('invalid_sync_response')
         joined, invite_changed = self._join_invitations(response)
-        catch_up_changed = (self._catch_up_joined_rooms(
-            joined, since=snapshot['since']) if joined else False)
-        commands = self._commands(response)
+        seen_events = {}
+        gap_budget = {'requests': 0, 'events': 0}
+        catch_up_commands = (self._catch_up_joined_rooms(
+            joined, since=snapshot['since'], seen_events=seen_events,
+            gap_budget=gap_budget)
+            if joined else [])
+        global_commands = self._commands(
+            response, since=snapshot['since'], seen_events=seen_events,
+            gap_budget=gap_budget)
+        commands = _dedupe_commands(catch_up_commands + global_commands)
         for room_id, event_id, user_id, command in commands:
             self._process_command(room_id, event_id, user_id, command)
         self.state.advance_cursor(cursor)
-        return bool(commands) or startup_changed or invite_changed or catch_up_changed
+        return bool(commands) or startup_changed or invite_changed
 
     def _stage_inbox(self):
         try:
