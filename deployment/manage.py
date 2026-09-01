@@ -40,6 +40,9 @@ UNIT = Path('/etc/systemd/system/methodenbot.service')
 DROPIN_DIR = Path('/etc/systemd/system/methodenbot.service.d')
 DROPIN = DROPIN_DIR / '20-final.conf'
 BACKUPS = Path('/var/backups/methodenbot-final')
+MAX_ADDITIONAL_CONTROL_ROOMS = 8
+MATRIX_USER_ID = re.compile(r'@[^\s:]+:[^\s]+')
+MATRIX_ROOM_ID = re.compile(r'![^\s:]+:[^\s]+')
 
 
 class DeployError(RuntimeError):
@@ -155,6 +158,39 @@ def env_values(lines):
     return values
 
 
+def additional_control_rooms(raw, *, control_user, control_room, production_room):
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate_json_key')
+            result[key] = value
+        return result
+
+    if not isinstance(raw, str) or len(raw.encode('utf-8')) > 16_384:
+        raise DeployError('matrix_additional_control_rooms_invalid')
+    try:
+        value = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+    except (TypeError, ValueError, RecursionError):
+        raise DeployError('matrix_additional_control_rooms_invalid') from None
+    if (not isinstance(value, dict) or len(value) > MAX_ADDITIONAL_CONTROL_ROOMS
+            or any(not isinstance(user, str) or not MATRIX_USER_ID.fullmatch(user)
+                   or not isinstance(room, str) or not MATRIX_ROOM_ID.fullmatch(room)
+                   for user, room in value.items())
+            or len(set(value.values())) != len(value)
+            or control_user in value
+            or control_room in value.values()
+            or production_room in value.values()):
+        raise DeployError('matrix_additional_control_rooms_invalid')
+    return value
+
+
+def control_bindings_hash(control_user, control_room, additional):
+    bindings = [(control_user, control_room), *sorted(additional.items())]
+    raw = json.dumps(bindings, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()
+
+
 def final_runtime_env(source):
     try:
         lines = source.read_text(encoding='utf-8').splitlines()
@@ -162,10 +198,20 @@ def final_runtime_env(source):
         raise DeployError('production_env_unreadable') from None
     source_values = env_values(lines)
     control_user = source_values.get('MATRIX_CONTROL_USER', '')
-    if not re.fullmatch(r'@[^\s:]+:[^\s]+', control_user):
+    if not MATRIX_USER_ID.fullmatch(control_user):
         raise DeployError('matrix_control_user_invalid')
+    control_room = source_values.get('MATRIX_CONSOLE_ROOM_ID', '')
+    production_room = source_values.get('MATRIX_ROOM_ID', '')
+    if not MATRIX_ROOM_ID.fullmatch(control_room) or not MATRIX_ROOM_ID.fullmatch(production_room):
+        raise DeployError('matrix_room_id_invalid')
+    additional = additional_control_rooms(
+        source_values.get('MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON', '{}'),
+        control_user=control_user,
+        control_room=control_room, production_room=production_room)
     managed = {
         'MATRIX_CONTROL_USER': control_user,
+        'MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON': json.dumps(
+            additional, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
         'MATRIX_DEVICE_ID': 'METHODENBOT_FINAL_2026_08',
         'MATRIX_ALLOW_UNENCRYPTED_CONTROL_DM': 'true',
         'METHODENBOT_AI_ENABLED': 'true',
@@ -297,7 +343,7 @@ def validate_existing_runtime(identity):
                  'MATRIX_ALLOW_UNENCRYPTED_TEST_DM', 'METHODENBOT_STATE_DIR',
                  'METHODENBOT_ENV_FILE', 'MATRIX_TOKEN_FILE'}
     control_user = values.get('MATRIX_CONTROL_USER', '')
-    if (not re.fullmatch(r'@[^\s:]+:[^\s]+', control_user)
+    if (not MATRIX_USER_ID.fullmatch(control_user)
             or any(values.get(key) != value for key, value in expected.items())
             or forbidden & set(values)):
         raise DeployError('canonical_runtime_configuration_invalid')
@@ -567,26 +613,46 @@ def verify_service(expected_release, *, attempts=20, stable_seconds=5, sleep=tim
 def wait_control_ready(expected_release, expected_pid, identity, *, attempts=90, sleep=time.sleep):
     """Wait for the synchronous Matrix bootstrap without accepting a PID restart."""
     control_file = STATE / 'control/state.json'
+    ready_file = STATE / 'control/ready.json'
+    try:
+        runtime_values = env_values(RUNTIME_ENV.read_text(encoding='utf-8').splitlines())
+        control_user = runtime_values.get('MATRIX_CONTROL_USER', '')
+        control_room = runtime_values.get('MATRIX_CONSOLE_ROOM_ID', '')
+        production_room = runtime_values.get('MATRIX_ROOM_ID', '')
+        additional = additional_control_rooms(
+            runtime_values.get('MATRIX_ADDITIONAL_CONTROL_ROOMS_JSON', '{}'),
+            control_user=control_user, control_room=control_room,
+            production_room=production_room)
+        expected_hash = control_bindings_hash(control_user, control_room, additional)
+    except (OSError, UnicodeError):
+        raise DeployError('production_env_unreadable') from None
     for attempt in range(attempts):
         if service_snapshot(expected_release) != expected_pid:
             raise DeployError('service_not_stable')
         try:
             validate_protected_file(control_file, mode=0o600,
                                     uid=identity.pw_uid, gid=identity.pw_gid)
+            validate_protected_file(ready_file, mode=0o600,
+                                    uid=identity.pw_uid, gid=identity.pw_gid)
         except DeployError as exc:
             if str(exc) != 'protected_runtime_file_missing':
                 raise
         else:
             try:
-                if control_file.stat().st_size > 2_000_000:
+                if control_file.stat().st_size > 2_000_000 or ready_file.stat().st_size > 4096:
                     raise DeployError('control_state_invalid')
                 control = json.loads(control_file.read_text(encoding='utf-8'))
+                ready = json.loads(ready_file.read_text(encoding='utf-8'))
             except DeployError:
                 raise
             except (OSError, UnicodeError, ValueError, RecursionError):
                 raise DeployError('control_state_invalid') from None
             if (not isinstance(control, dict) or type(control.get('ai_enabled')) is not bool
-                    or control.get('since') is not None and not isinstance(control.get('since'), str)):
+                    or control.get('since') is not None and not isinstance(control.get('since'), str)
+                    or not isinstance(ready, dict)
+                    or set(ready) != {'version', 'pid', 'controllers_sha256'}
+                    or ready.get('version') != 1 or ready.get('pid') != expected_pid
+                    or ready.get('controllers_sha256') != expected_hash):
                 raise DeployError('control_state_invalid')
             if isinstance(control.get('since'), str) and control['since']:
                 return control

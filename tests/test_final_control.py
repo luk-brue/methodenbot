@@ -197,7 +197,9 @@ class FinalControlTests(unittest.TestCase):
                        event('$3', 'KI aus'), event('$4', 'Test')]}}}}}]
         seen = []
 
-        def plan(_exchange, config, _ai, *, command, command_event_id, ai_enabled):
+        def plan(_exchange, config, _ai, *, command, command_event_id, ai_enabled,
+                 reply_room_id=None):
+            self.assertEqual(reply_room_id, CONTROL)
             seen.append(ai_enabled)
             return [{'msg': command, 'html_msg': '<p>' + command + '</p>', 'room_id': CONTROL,
                      'thread_root_part': None, 'transaction_id': 'tx-' + command_event_id[1:],
@@ -234,8 +236,10 @@ class FinalControlTests(unittest.TestCase):
             self.assertIn(accepted_transaction, self.bot.transaction_events)
             return exchange_with()
 
-        def plan(_exchange, config, _ai, *, command, command_event_id, ai_enabled):
+        def plan(_exchange, config, _ai, *, command, command_event_id, ai_enabled,
+                 reply_room_id=None):
             self.assertEqual((command, command_event_id, ai_enabled), ('Test', '$slow', False))
+            self.assertEqual(reply_room_id, CONTROL)
             accepted_event = self.bot.transaction_events[accepted_transaction]
             self.assertIn('Test angenommen',
                           self.bot.events[CONTROL, accepted_event]['content']['body'])
@@ -299,7 +303,7 @@ class FinalControlTests(unittest.TestCase):
         self.assertTrue(first['transaction_id'].endswith('-accepted'))
         self.assertIn('mehrere Minuten', first['msg'])
         self.assertIn('echten Zielkanal', no_ai['msg'])
-        self.assertNotIn('mehrere Minuten', no_ai['msg'])
+        self.assertIn('globaler KI-Einstellung', no_ai['msg'])
         ai_off = Mock()
         ai_off.render.return_value = None
         planned = build_test_plan(exchange_with(), self.config, ai_off, command='Test',

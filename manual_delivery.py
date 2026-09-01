@@ -107,7 +107,8 @@ def _part(msg, html_msg, room_id, thread_root_part, transaction_id):
             'event_id': None}
 
 
-def build_test_plan(exchange, config, ai_service, *, command, command_event_id, ai_enabled):
+def build_test_plan(exchange, config, ai_service, *, command, command_event_id, ai_enabled,
+                    reply_room_id=None):
     """Freeze all test content before the first test-content Matrix side effect."""
     if command not in ('Test', 'Test 2'):
         raise ManualDeliveryError('invalid_test_command')
@@ -123,7 +124,9 @@ def build_test_plan(exchange, config, ai_service, *, command, command_event_id, 
         ai = ai_service.render(email_data, enabled=ai_enabled)
         rendered.append((root, ai, detail))
 
-    room_id = config.matrix_console_room_id if command == 'Test' else config.matrix_room_id
+    reply_room_id = (config.matrix_console_room_id
+                     if reply_room_id is None else reply_room_id)
+    room_id = reply_room_id if command == 'Test' else config.matrix_room_id
     parts = []
     for request_index, (root, ai, detail) in enumerate(rendered, 1):
         label = ('Test · ' + str(request_index) + '/3') if command == 'Test' else 'Techniktest'
@@ -140,12 +143,12 @@ def build_test_plan(exchange, config, ai_service, *, command, command_event_id, 
     if command == 'Test 2':
         notice = 'Techniktest im echten Zielkanal wurde vollständig zugestellt und zurückgelesen.'
         parts.append(_part(notice, '<p>' + html.escape(notice) + '</p>',
-                           config.matrix_console_room_id, None,
+                           reply_room_id, None,
                            _transaction(command_event_id, len(parts))))
     return parts
 
 
-def build_test_wait_ack(config, command_event_id, command, ai_enabled):
+def build_test_wait_ack(config, command_event_id, command, ai_enabled, *, reply_room_id=None):
     if command not in ('Test', 'Test 2'):
         raise ManualDeliveryError('invalid_test_command')
     if command == 'Test':
@@ -153,35 +156,38 @@ def build_test_wait_ack(config, command_event_id, command, ai_enabled):
     else:
         text = ('Test 2 angenommen. Ich bereite die letzte Anfrage für den Techniktest '
                 'im echten Zielkanal vor.')
-    if ai_enabled:
-        text += ' Mit eingeschalteter KI kann das mehrere Minuten dauern.'
-    else:
-        text += ' Die Ergebnisse folgen.'
-    text += ' Weitere Testbefehle werden anschließend bearbeitet.'
+    text += (' Je nach globaler KI-Einstellung kann die Vorbereitung mehrere Minuten dauern. '
+             'Weitere Befehle werden seriell bearbeitet.')
     digest = hashlib.sha256(command_event_id.encode('utf-8')).hexdigest()[:40]
-    return _part(text, '<p>' + html.escape(text) + '</p>', config.matrix_console_room_id,
+    reply_room_id = (config.matrix_console_room_id
+                     if reply_room_id is None else reply_room_id)
+    return _part(text, '<p>' + html.escape(text) + '</p>', reply_room_id,
                  None, 'control-' + digest + '-accepted')
 
 
-def build_toggle_ack(config, command_event_id, enabled):
+def build_toggle_ack(config, command_event_id, enabled, *, reply_room_id=None):
     text = ('KI-Zusammenfassungen sind jetzt eingeschaltet.' if enabled
             else 'KI-Zusammenfassungen sind jetzt ausgeschaltet.')
-    return [_part(text, '<p>' + html.escape(text) + '</p>', config.matrix_console_room_id,
+    reply_room_id = (config.matrix_console_room_id
+                     if reply_room_id is None else reply_room_id)
+    return [_part(text, '<p>' + html.escape(text) + '</p>', reply_room_id,
                   None, _transaction(command_event_id, 0))]
 
 
-def build_failure_ack(config, command_event_id, code):
+def build_failure_ack(config, command_event_id, code, *, reply_room_id=None):
     safe_codes = {
         'ai_unavailable': 'KI konnte nicht eingeschaltet werden; Freigabe oder lokaler Zugang fehlen.',
         'test_failed': ('Der Test konnte vor dem Versand nicht vollständig vorbereitet werden. '
                         'Es wurden keine Testinhalte versendet.'),
     }
     text = safe_codes.get(code, 'Der Befehl konnte sicher nicht ausgeführt werden.')
-    return [_part(text, '<p>' + html.escape(text) + '</p>', config.matrix_console_room_id,
+    reply_room_id = (config.matrix_console_room_id
+                     if reply_room_id is None else reply_room_id)
+    return [_part(text, '<p>' + html.escape(text) + '</p>', reply_room_id,
                   None, _transaction(command_event_id, 0))]
 
 
-def build_delivery_failure_ack(config, command_event_id, command):
+def build_delivery_failure_ack(config, command_event_id, command, *, reply_room_id=None):
     if command in ('KI an', 'KI aus'):
         state = 'eingeschaltet' if command == 'KI an' else 'ausgeschaltet'
         text = ('Der KI-Schalter wurde ' + state
@@ -190,5 +196,7 @@ def build_delivery_failure_ack(config, command_event_id, command):
         text = ('Der Testbefehl wurde nach wiederholtem Zustellfehler beendet. '
                 'Eine Teilzustellung ist möglich; es erfolgt keine automatische Wiederholung.')
     digest = hashlib.sha256(command_event_id.encode('utf-8')).hexdigest()[:40]
-    return [_part(text, '<p>' + html.escape(text) + '</p>', config.matrix_console_room_id,
+    reply_room_id = (config.matrix_console_room_id
+                     if reply_room_id is None else reply_room_id)
+    return [_part(text, '<p>' + html.escape(text) + '</p>', reply_room_id,
                   None, 'control-' + digest + '-delivery-failed')]

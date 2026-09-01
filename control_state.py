@@ -220,6 +220,14 @@ class ControlState:
             data['ai_enabled'] = bool(enabled)
         return self._change(update)['ai_enabled']
 
+    def set_ai_enabled(self, enabled):
+        """Set the shared AI switch without coupling it to one room queue."""
+        if type(enabled) is not bool:
+            raise ControlStateError('invalid_ai_state')
+        def update(data):
+            data['ai_enabled'] = enabled
+        return self._change(update)['ai_enabled']
+
     def complete_head(self, event_id):
         def update(data):
             if not data['queue'] or data['queue'][0]['event_id'] != event_id:
