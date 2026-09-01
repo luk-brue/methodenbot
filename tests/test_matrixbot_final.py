@@ -109,6 +109,60 @@ class MatrixFinalTests(unittest.TestCase):
                          ['!one:example.invalid', '!two:example.invalid'])
         self.assertTrue(api.requests[-1][1].endswith('/joined_rooms'))
 
+    def test_room_messages_reads_exact_forward_bounded_range(self):
+        api = API()
+        room_id = '!private:example.invalid'
+        page = {
+            'start': 'sync-old', 'end': 'timeline-start',
+            'chunk': [{
+                'room_id': room_id, 'event_id': '$one', 'type': 'm.room.message',
+                'sender': '@reader:example.invalid',
+                'content': {'msgtype': 'm.text', 'body': 'Digest'},
+            }],
+        }
+        api.send_responses = [Response(200, page)]
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        self.assertEqual(bot.room_messages(
+            room_id, from_token='sync-old', to_token='timeline-start'), page)
+        method, url, kwargs = api.requests[-1]
+        self.assertEqual(method, 'GET')
+        self.assertTrue(url.endswith(
+            '/rooms/%21private%3Aexample.invalid/messages'))
+        self.assertEqual(kwargs['params'], {
+            'dir': 'f', 'from': 'sync-old', 'to': 'timeline-start', 'limit': 50})
+
+    def test_room_messages_accepts_empty_page_with_progress_token(self):
+        api = API()
+        api.send_responses = [Response(200, {
+            'start': 'sync-old', 'end': 'next-page', 'chunk': []})]
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        self.assertEqual(bot.room_messages(
+            '!private:example.invalid', from_token='sync-old',
+            to_token='timeline-start')['end'], 'next-page')
+
+    def test_room_messages_rejects_malformed_schema_and_no_progress(self):
+        room_id = '!private:example.invalid'
+        invalid_pages = [
+            {'start': 'wrong', 'chunk': []},
+            {'start': 'sync-old', 'chunk': {}},
+            {'start': 'sync-old', 'end': 'sync-old', 'chunk': []},
+            {'start': 'sync-old', 'chunk': [{'room_id': '!other:example.invalid'}]},
+            {'start': 'sync-old', 'chunk': [
+                {'room_id': room_id} for _index in range(51)]},
+        ]
+        for page in invalid_pages:
+            with self.subTest(page=page):
+                api = API()
+                api.send_responses = [Response(200, page)]
+                bot = MatrixBot(
+                    self.config(), session_factory=api.factory,
+                    sleep=lambda seconds: None)
+                with self.assertRaisesRegex(
+                        MatrixError, 'invalid_matrix_messages_response'):
+                    bot.room_messages(
+                        room_id, from_token='sync-old',
+                        to_token='timeline-start')
+
     def test_private_room_invite_uses_fixed_user_payload_without_retry(self):
         api = API()
         api.send_responses = [Response(200, {})]

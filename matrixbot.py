@@ -510,6 +510,30 @@ class MatrixBot:
         return self.request_json('GET', '/sync', params=params,
                                  timeout=(5, max(30, timeout_ms / 1000 + 10)))
 
+    def room_messages(self, room_id, *, from_token, to_token, limit=50):
+        """Read one forward page between two Matrix timeline tokens."""
+        if (not isinstance(room_id, str) or not room_id.startswith('!')
+                or not isinstance(from_token, str) or not 0 < len(from_token) <= 8192
+                or not isinstance(to_token, str) or not 0 < len(to_token) <= 8192
+                or type(limit) is not int or not 1 <= limit <= 100):
+            raise MatrixError('invalid_matrix_messages_request')
+        path = '/rooms/' + quote(room_id, safe='') + '/messages'
+        body = self.request_json(
+            'GET', path,
+            params={'dir': 'f', 'from': from_token, 'to': to_token, 'limit': limit})
+        chunk = body.get('chunk') if isinstance(body, dict) else None
+        start = body.get('start') if isinstance(body, dict) else None
+        if (not isinstance(chunk, list) or len(chunk) > limit or start != from_token
+                or any(not isinstance(event, dict)
+                       or event.get('room_id') != room_id for event in chunk)):
+            raise MatrixError('invalid_matrix_messages_response')
+        if 'end' in body:
+            end = body['end']
+            if (not isinstance(end, str) or not end or len(end) > 8192
+                    or end == from_token):
+                raise MatrixError('invalid_matrix_messages_response')
+        return body
+
     def logout(self):
         try:
             self.request_json('POST', '/logout', payload={}, idempotent=False)
