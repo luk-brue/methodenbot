@@ -287,6 +287,68 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(self.state.snapshot()['since'], 's0')
         self.assertEqual(self.state.snapshot()['subscriptions'], {})
 
+    def test_limited_group_room_does_not_block_digest_dm_or_cursor(self):
+        self.state.bootstrap('s0')
+        group = '!busy-group:example.org'
+        self.bot.states[group] = room_state(extra='@third:example.org')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {
+            group: {'timeline': {'limited': True, 'events': []}},
+            ROOM: {'timeline': {'events': [event('$subscribe', 'Digest')]}}
+        }}}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.state.snapshot()['subscriptions'][USER]['room_id'], ROOM)
+        self.assertEqual(self.state.snapshot()['since'], 's1')
+        self.assertIn('Digest aktiviert', self.bot.send_attempts[-1][2])
+
+    def test_limited_existing_digest_dm_remains_fail_closed(self):
+        self.state.bootstrap('s0')
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {ROOM: {
+            'timeline': {'limited': True,
+                         'events': [event('$possibly-incomplete', 'Digest')]}
+        }}}}]
+        with self.assertRaisesRegex(MatrixError, 'invalid_sync_response'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+
+    def test_limited_digest_dm_aborts_before_other_room_side_effects(self):
+        self.state.bootstrap('s0')
+        second_room = '!second-digest:example.org'
+        self.bot.states[second_room] = room_state()
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {
+            ROOM: {'timeline': {'events': [event('$would-subscribe', 'Digest')]}},
+            second_room: {'timeline': {'limited': True, 'events': []}},
+        }}}]
+        with self.assertRaisesRegex(MatrixError, 'invalid_sync_response'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+
+    def test_limited_encrypted_room_is_safely_skipped(self):
+        self.state.bootstrap('s0')
+        encrypted = '!encrypted-legacy:example.org'
+        self.bot.states[encrypted] = room_state(encrypted=True)
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {
+            encrypted: {'timeline': {'limited': True, 'events': []}},
+        }}}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.state.snapshot()['since'], 's1')
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+
+    def test_limited_room_with_unknown_state_remains_fail_closed(self):
+        self.state.bootstrap('s0')
+        unknown = '!unknown-state:example.org'
+        self.bot.states[unknown] = [
+            {'type': 'm.room.member', 'state_key': BOT, 'content': {}}]
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'join': {unknown: {
+            'timeline': {'limited': True, 'events': []}
+        }}}}]
+        with self.assertRaisesRegex(MatrixError, 'invalid_digest_room_state'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+
     def test_digest_command_immediately_sends_latest_newsletter_and_ris(self):
         inbox = Path(self.config.digest_inbox_dir)
         inbox.mkdir(mode=0o700)

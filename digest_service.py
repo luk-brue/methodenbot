@@ -239,6 +239,56 @@ def validate_digest_room(bot, room_id, user_id, *, state=None):
     return True
 
 
+def _limited_room_definitely_not_digest(bot, room_id):
+    """Return true only when current state rules out a valid Digest DM.
+
+    A limited global sync timeline can omit an earlier command.  It is safe to
+    advance past that room only when the complete current state proves that the
+    command would be rejected by ``validate_digest_room`` anyway.  Malformed or
+    internally inconsistent state remains fail-closed.
+    """
+    state = bot.get_room_state(room_id)
+    if not isinstance(state, list) or len(state) > 20_000:
+        raise MatrixError('invalid_digest_room_state')
+    joined, invited, seen = set(), set(), set()
+    allowed_memberships = {'ban', 'invite', 'join', 'knock', 'leave'}
+    for event in state:
+        if (not isinstance(event, dict) or not isinstance(event.get('type'), str)
+                or not isinstance(event.get('state_key'), str)
+                or not isinstance(event.get('content'), dict)):
+            raise MatrixError('invalid_digest_room_state')
+        identity = (event['type'], event['state_key'])
+        if identity in seen:
+            raise MatrixError('invalid_digest_room_state')
+        seen.add(identity)
+        if event['type'] != 'm.room.member':
+            continue
+        membership = event['content'].get('membership')
+        if (not isinstance(membership, str) or membership not in allowed_memberships
+                or not event['state_key'].startswith('@')):
+            raise MatrixError('invalid_digest_room_state')
+        if membership == 'join':
+            joined.add(event['state_key'])
+        elif membership == 'invite':
+            invited.add(event['state_key'])
+    if bot.user_id not in joined:
+        raise MatrixError('inconsistent_digest_room_state')
+    peers = joined - {bot.user_id}
+    if len(peers) != 1 or invited:
+        return True
+    user_id = next(iter(peers))
+    try:
+        validate_digest_room(bot, room_id, user_id, state=state)
+    except DigestServiceError as exc:
+        if str(exc) in {
+                'encrypted_digest_room_unsupported',
+                'digest_room_not_private',
+                'unsafe_digest_room_access'}:
+            return True
+        raise MatrixError('invalid_digest_room_state') from None
+    return False
+
+
 def _validate_fallback_room(bot, room_id, user_id, target_sha256, *,
                             allow_missing_user=False, state=None):
     singleton, memberships = _digest_room_state(
@@ -551,11 +601,21 @@ class DigestService:
         for room_id, room in joined.items():
             if only_room_id is not None and room_id != only_room_id:
                 continue
-            timeline = room.get('timeline', {}) if isinstance(room, dict) else {}
-            events = timeline.get('events', []) if isinstance(timeline, dict) else []
-            if (not isinstance(events, list) or len(events) > 50
-                    or timeline.get('limited', False) is not False):
+            if not isinstance(room_id, str) or not room_id.startswith('!'):
                 raise MatrixError('invalid_sync_response')
+            timeline = room.get('timeline', {}) if isinstance(room, dict) else None
+            events = timeline.get('events', []) if isinstance(timeline, dict) else None
+            limited = timeline.get('limited', False) if isinstance(timeline, dict) else None
+            if (not isinstance(events, list) or len(events) > 50
+                    or type(limited) is not bool):
+                raise MatrixError('invalid_sync_response')
+            if limited:
+                if (only_room_id is not None
+                        or not _limited_room_definitely_not_digest(self.bot, room_id)):
+                    raise MatrixError('invalid_sync_response')
+                logger.warning(
+                    'Begrenzte Timeline eines eindeutig ungeeigneten Digest-Raums übersprungen.')
+                continue
             for event in events:
                 command = digest_command_from_event(event)
                 if command is not None and command[1] != self.bot.user_id:
