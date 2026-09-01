@@ -3,8 +3,8 @@
 Stand: 01.09.2026. Diese Arbeitskopie verbindet den bisherigen produktiven
 Methodenbot mit der getesteten GWDG-KI-Zusammenfassung und einer explizit
 freigegebenen persönlichen Matrix-Steuerung für mehrere Verantwortliche. Sie
-enthält außerdem den vollständigen Wochen-Digest mit Markdown-Newsletter und
-RIS-Datei.
+enthält außerdem den vollständigen Wochen-Digest als formatierte Matrix-Nachricht
+und als herunterladbare Markdown- und RIS-Dateien.
 
 ## Verhalten
 
@@ -102,7 +102,8 @@ Interessierte Personen eröffnen selbst einen privaten Raum mit dem Methodenbot 
 senden dort als Textnachricht exakt `Digest`. Der Bot nimmt neue prüfbare
 Raumeinladungen automatisch an, holt auch einen unmittelbar mit der Einladung gesendeten
 ersten Befehl gezielt nach, bestätigt anschließend das Abonnement und sendet sofort die
-jüngste reguläre Ausgabe einschließlich der zugehörigen RIS-Datei. Matrix-Clients dürfen
+jüngste reguläre Ausgabe einschließlich der zugehörigen Markdown- und RIS-Dateien.
+Matrix-Clients dürfen
 den Text standardkonform formatiert übertragen; maßgeblich bleibt der Klartextinhalt.
 `Digest aus` beendet das Abonnement wieder. Pro Matrix-Benutzer-ID ist genau ein Zielraum
 aktiv; ein neues `Digest` in einem anderen privaten Raum ersetzt den bisherigen Zielraum.
@@ -132,9 +133,15 @@ Die geprüfte Datei gelangt nicht über Git oder die Exchange-Inbox in den Bot, 
    `/var/lib/methodenbot/digest/inbox/` gespeichertes Bundle. Erst danach meldet der
    lokale Uploader Erfolg.
 5. Der laufende Bot friert Inhalte, Empfängerliste und Hashes geschützt ein, sendet
-   Markdown als formatierte, größenbegrenzte Matrix-Nachrichten und RIS als
-   herunterladbare Datei. Stabile Matrix-Transaktions-IDs, persistente Medien-URIs und
-   Readback verhindern sichtbare Doppelzustellungen nach einem Neustart.
+   Markdown als formatierte, größenbegrenzte Matrix-Nachrichten und hängt sowohl das
+   unveränderte Markdown als auch RIS als herunterladbare Dateien an. Stabile
+   Matrix-Transaktions-IDs, persistente Medien-URIs und Readback verhindern sichtbare
+   Doppelzustellungen nach einem Neustart.
+
+Der zusätzliche Markdown-Uploadnachweis liegt als geschützte, hashgebundene Sidecar-Datei
+neben der eingefrorenen Ausgabe. Das bestehende Digest-Statusformat bleibt unverändert in
+Version 2, damit ein Rollback auf die vorherige Bot-Version denselben Status weiter lesen
+kann. Bereits abgeschlossene Ausgaben werden nicht nachträglich erneut verschickt.
 
 Beispiel für den lokalen Aufruf nach erfolgreicher Digest-Prüfung:
 

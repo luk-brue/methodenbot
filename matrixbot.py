@@ -22,9 +22,19 @@ import requests
 logger = logging.getLogger(__name__)
 MAX_EVENT_CONTENT_BYTES = 48_000
 MAX_MATRIX_FILE_BYTES = 1_000_000
-MATRIX_FILE_NAME = re.compile(r'\d{4}-\d{2}-\d{2}-methoden-artikel\.ris')
+MATRIX_RIS_FILE_NAME = re.compile(r'\d{4}-\d{2}-\d{2}-methoden-artikel\.ris')
+MATRIX_MARKDOWN_FILE_NAME = re.compile(r'\d{4}-\d{2}-\d{2}-methoden-digest\.md')
 MATRIX_CONTENT_URI = re.compile(r'mxc://([A-Za-z0-9._:-]+)/([A-Za-z0-9_-]+)')
 DIGEST_FALLBACK_MARKER = 'de.uni-kassel.methodenbot.digest_fallback'
+
+
+def matrix_file_mimetype(filename):
+    if isinstance(filename, str):
+        if MATRIX_RIS_FILE_NAME.fullmatch(filename):
+            return 'application/x-research-info-systems'
+        if MATRIX_MARKDOWN_FILE_NAME.fullmatch(filename):
+            return 'text/markdown; charset=utf-8'
+    return None
 
 
 class MatrixError(RuntimeError):
@@ -304,13 +314,14 @@ class MatrixBot:
             raise MatrixError('matrix_media_create_unconfirmed')
         return content_uri
 
-    def upload_media(self, content_uri, raw, filename,
-                     content_type='application/x-research-info-systems'):
+    def upload_media(self, content_uri, raw, filename, content_type=None):
         match = MATRIX_CONTENT_URI.fullmatch(content_uri or '')
+        expected_type = matrix_file_mimetype(filename)
         if (match is None or not isinstance(raw, bytes) or not 0 < len(raw) <= MAX_MATRIX_FILE_BYTES
-                or MATRIX_FILE_NAME.fullmatch(filename or '') is None
-                or content_type != 'application/x-research-info-systems'):
+                or expected_type is None
+                or content_type not in (None, expected_type)):
             raise MatrixError('invalid_matrix_media')
+        content_type = expected_type
         path = ('/_matrix/media/v3/upload/' + quote(match.group(1), safe=':') + '/'
                 + quote(match.group(2), safe=''))
         self.request_media_json('PUT', path, raw=raw, content_type=content_type,
@@ -352,14 +363,15 @@ class MatrixBot:
         return self._send_content(content, room_id, transaction_id)
 
     def send_file(self, content_uri, filename, size, room_id=None, transaction_id=None):
+        content_type = matrix_file_mimetype(filename)
         if (MATRIX_CONTENT_URI.fullmatch(content_uri or '') is None
-                or MATRIX_FILE_NAME.fullmatch(filename or '') is None
+                or content_type is None
                 or type(size) is not int or not 0 < size <= MAX_MATRIX_FILE_BYTES):
             raise MatrixError('invalid_matrix_file')
         content = {
             'msgtype': 'm.file', 'body': filename, 'filename': filename,
             'url': content_uri,
-            'info': {'mimetype': 'application/x-research-info-systems', 'size': size},
+            'info': {'mimetype': content_type, 'size': size},
         }
         return self._send_content(content, room_id, transaction_id)
 
