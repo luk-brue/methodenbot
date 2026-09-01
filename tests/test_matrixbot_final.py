@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from matrixbot import MatrixBot, MatrixError
+from matrixbot import DIGEST_FALLBACK_MARKER, MatrixBot, MatrixError
 
 
 class Response:
@@ -99,6 +99,64 @@ class MatrixFinalTests(unittest.TestCase):
         bot = MatrixBot(config, session_factory=api.factory, sleep=lambda seconds: None)
         self.assertEqual(bot.join_room('!private:example.invalid'), '!private:example.invalid')
         self.assertTrue(api.requests[-1][1].endswith('/join/%21private%3Aexample.invalid'))
+
+    def test_joined_rooms_are_strictly_validated(self):
+        api = API()
+        api.send_responses = [Response(200, {
+            'joined_rooms': ['!one:example.invalid', '!two:example.invalid']})]
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        self.assertEqual(bot.joined_room_ids(),
+                         ['!one:example.invalid', '!two:example.invalid'])
+        self.assertTrue(api.requests[-1][1].endswith('/joined_rooms'))
+
+    def test_private_room_invite_uses_fixed_user_payload_without_retry(self):
+        api = API()
+        api.send_responses = [Response(200, {})]
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        self.assertTrue(bot.invite_user(
+            '!fallback:example.invalid', '@reader:example.invalid'))
+        method, url, kwargs = api.requests[-1]
+        self.assertEqual(method, 'POST')
+        self.assertTrue(url.endswith('/rooms/%21fallback%3Aexample.invalid/invite'))
+        self.assertEqual(kwargs['json'], {'user_id': '@reader:example.invalid'})
+
+    def test_digest_fallback_room_has_private_marker_and_hardened_power_levels(self):
+        api = API()
+        api.send_responses = [Response(200, {'room_id': '!fallback:example.invalid'})]
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        target = '@reader:example.invalid'
+        target_hash = 'a' * 64
+        self.assertEqual(bot.create_digest_fallback_room(target, target_hash),
+                         '!fallback:example.invalid')
+        method, url, kwargs = api.requests[-1]
+        self.assertEqual(method, 'POST')
+        self.assertTrue(url.endswith('/createRoom'))
+        payload = kwargs['json']
+        self.assertEqual(payload['visibility'], 'private')
+        self.assertEqual(payload['preset'], 'private_chat')
+        self.assertTrue(payload['is_direct'])
+        self.assertEqual(payload['invite'], [target])
+        self.assertEqual(payload['creation_content'][DIGEST_FALLBACK_MARKER], {
+            'version': 1, 'target_sha256': target_hash})
+        states = {value['type']: value['content'] for value in payload['initial_state']}
+        self.assertEqual(states['m.room.join_rules'], {'join_rule': 'invite'})
+        self.assertEqual(states['m.room.guest_access'], {'guest_access': 'forbidden'})
+        self.assertNotIn('m.room.encryption', states)
+        levels = payload['power_level_content_override']
+        self.assertEqual(levels['users_default'], 0)
+        self.assertEqual(levels['events_default'], 0)
+        self.assertEqual(levels['state_default'], 100)
+        self.assertEqual(levels['invite'], 100)
+        self.assertEqual(levels['events']['m.room.encryption'], 100)
+        self.assertEqual(levels['events']['m.room.tombstone'], 150)
+
+    def test_digest_fallback_create_is_never_retried_blindly(self):
+        api = API()
+        api.send_responses = [Response(500, {'errcode': 'M_UNKNOWN'})]
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        with self.assertRaisesRegex(MatrixError, 'matrix_http_error'):
+            bot.create_digest_fallback_room('@reader:example.invalid', 'a' * 64)
+        self.assertEqual(len(api.requests), 1)
 
     def test_401_refresh_uses_new_header_and_identical_transaction_url(self):
         api = API()

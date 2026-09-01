@@ -24,6 +24,7 @@ MAX_EVENT_CONTENT_BYTES = 48_000
 MAX_MATRIX_FILE_BYTES = 1_000_000
 MATRIX_FILE_NAME = re.compile(r'\d{4}-\d{2}-\d{2}-methoden-artikel\.ris')
 MATRIX_CONTENT_URI = re.compile(r'mxc://([A-Za-z0-9._:-]+)/([A-Za-z0-9_-]+)')
+DIGEST_FALLBACK_MARKER = 'de.uni-kassel.methodenbot.digest_fallback'
 
 
 class MatrixError(RuntimeError):
@@ -406,6 +407,86 @@ class MatrixBot:
         if joined != room_id:
             raise MatrixError('matrix_join_unconfirmed')
         return joined
+
+    def joined_room_ids(self):
+        body = self.request_json('GET', '/joined_rooms')
+        rooms = body.get('joined_rooms') if isinstance(body, dict) else None
+        if (not isinstance(rooms, list) or len(rooms) > 20_000
+                or any(not isinstance(room_id, str) or not room_id.startswith('!')
+                       for room_id in rooms)
+                or len(set(rooms)) != len(rooms)):
+            raise MatrixError('matrix_joined_rooms_invalid')
+        return rooms
+
+    def invite_user(self, room_id, user_id):
+        if (not isinstance(room_id, str) or not room_id.startswith('!')
+                or not isinstance(user_id, str) or not user_id.startswith('@')
+                or user_id == self.user_id):
+            raise MatrixError('invalid_matrix_invite')
+        self.request_json(
+            'POST', '/rooms/' + quote(room_id, safe='') + '/invite',
+            payload={'user_id': user_id}, idempotent=False)
+        return True
+
+    def create_digest_fallback_room(self, user_id, target_sha256):
+        """Create one hardened, unencrypted private room for Digest commands.
+
+        ``createRoom`` is intentionally non-idempotent. Callers must reconcile
+        existing marker-bearing rooms before invoking this method and must not
+        blindly repeat it after an ambiguous network result.
+        """
+        if (not isinstance(user_id, str) or not user_id.startswith('@')
+                or user_id == self.user_id
+                or not isinstance(target_sha256, str)
+                or re.fullmatch(r'[0-9a-f]{64}', target_sha256) is None):
+            raise MatrixError('invalid_digest_fallback_target')
+        payload = {
+            'visibility': 'private',
+            'preset': 'private_chat',
+            'is_direct': True,
+            'invite': [user_id],
+            'creation_content': {
+                DIGEST_FALLBACK_MARKER: {
+                    'version': 1,
+                    'target_sha256': target_sha256,
+                },
+            },
+            'initial_state': [
+                {'type': 'm.room.join_rules', 'state_key': '',
+                 'content': {'join_rule': 'invite'}},
+                {'type': 'm.room.guest_access', 'state_key': '',
+                 'content': {'guest_access': 'forbidden'}},
+                {'type': 'm.room.history_visibility', 'state_key': '',
+                 'content': {'history_visibility': 'shared'}},
+            ],
+            'power_level_content_override': {
+                'users_default': 0,
+                'events_default': 0,
+                'state_default': 100,
+                'invite': 100,
+                'kick': 100,
+                'ban': 100,
+                'redact': 100,
+                'events': {
+                    'm.room.power_levels': 100,
+                    'm.room.encryption': 100,
+                    'm.room.join_rules': 100,
+                    'm.room.guest_access': 100,
+                    'm.room.history_visibility': 100,
+                    'm.room.name': 100,
+                    'm.room.topic': 100,
+                    'm.room.third_party_invite': 100,
+                    # Room v12+ requires tombstones above state_default.
+                    'm.room.tombstone': 150,
+                },
+            },
+        }
+        body = self.request_json('POST', '/createRoom', payload=payload,
+                                 idempotent=False)
+        room_id = body.get('room_id') if isinstance(body, dict) else None
+        if not isinstance(room_id, str) or not room_id.startswith('!'):
+            raise MatrixError('matrix_create_room_unconfirmed')
+        return room_id
 
     def direct_mapping(self):
         if not isinstance(self.user_id, str):
