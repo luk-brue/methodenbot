@@ -114,9 +114,12 @@ und nicht öffentlich lesbar ist. Gruppenräume werden ohne öffentliche Bot-Ant
 ignoriert. Der bestehende Matrix-Client kann keine Ende-zu-Ende-Verschlüsselung und tritt
 verschlüsselten Räumen deshalb nie bei. Für eine eindeutige verschlüsselte Einladung
 erstellt oder findet er stattdessen einen markierten, abgesicherten und unverschlüsselten
-privaten Zweierraum. Dort erklärt er, dass `Digest` erneut gesendet werden muss; aus dem
-unlesbaren Chiffrat wird niemals automatisch ein Abonnement abgeleitet. Diese Grenze wird
-mit `MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM=true` bewusst freigegeben.
+privaten Zweierraum. In einem neu angelegten oder noch nicht angenommenen Ersatzraum
+erklärt er, dass `Digest` erneut gesendet werden muss; ein bereits aktiver
+unverschlüsselter Zweierraum erhält keinen weiteren Hinweis. Erst wenn dieser sichere
+Ersatzweg bestätigt ist, lehnt der Bot die ursprüngliche verschlüsselte Einladung ab. Aus
+dem unlesbaren Chiffrat wird niemals automatisch ein Abonnement abgeleitet. Diese Grenze
+wird mit `MATRIX_ALLOW_UNENCRYPTED_DIGEST_DM=true` bewusst freigegeben.
 
 Die geprüfte Datei gelangt nicht über Git oder die Exchange-Inbox in den Bot, sondern
 über einen eng begrenzten SSH-Upload:
