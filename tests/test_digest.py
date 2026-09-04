@@ -31,10 +31,11 @@ ENCRYPTED_USER = '@encrypted-reader:example.org'
 SECOND_ENCRYPTED_USER = '@second-encrypted-reader:example.org'
 
 
-def room_state(*, extra=None, encrypted=False):
+def room_state(*, user_id=USER, extra=None, encrypted=False):
     result = [
         {'type': 'm.room.member', 'state_key': BOT, 'content': {'membership': 'join'}},
-        {'type': 'm.room.member', 'state_key': USER, 'content': {'membership': 'join'}},
+        {'type': 'm.room.member', 'state_key': user_id,
+         'content': {'membership': 'join'}},
         {'type': 'm.room.join_rules', 'state_key': '', 'content': {'join_rule': 'invite'}},
         {'type': 'm.room.guest_access', 'state_key': '',
          'content': {'guest_access': 'forbidden'}},
@@ -126,6 +127,10 @@ class FakeBot:
         self.joined = []
         self.created_rooms = []
         self.invited_users = []
+        self.rejected_invitations = []
+        self.reject_results = []
+        self.read_results = []
+        self.actions = []
         self.events = {}
         self.transactions = {}
         self.send_attempts = []
@@ -162,19 +167,31 @@ class FakeBot:
     def create_digest_fallback_room(self, user_id, target_sha256):
         room_id = '!fallback-' + str(len(self.created_rooms) + 1) + ':example.org'
         self.created_rooms.append((user_id, target_sha256, room_id))
+        self.actions.append(('create_fallback', room_id))
         self.states[room_id] = fallback_room_state(user_id, target_sha256)
         return room_id
 
     def invite_user(self, room_id, user_id):
         self.invited_users.append((room_id, user_id))
+        self.actions.append(('invite_user', room_id))
         self.states[room_id].append({
             'type': 'm.room.member', 'state_key': user_id,
             'content': {'membership': 'invite'}})
         return True
 
+    def reject_invitation(self, room_id):
+        self.rejected_invitations.append(room_id)
+        self.actions.append(('reject_invitation', room_id))
+        if self.reject_results:
+            result = self.reject_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+        return True
+
     def send_message(self, msg, room_id=None, transaction_id=None, html_msg=None, **_kwargs):
         self.delivery_attempts.append(('text', room_id, transaction_id))
         self.send_attempts.append((room_id, transaction_id, msg, html_msg))
+        self.actions.append(('send_message', room_id))
         if transaction_id in self.transactions:
             return self.transactions[transaction_id]
         event_id = '$sent-' + str(len(self.transactions) + 1)
@@ -218,6 +235,11 @@ class FakeBot:
         return event_id
 
     def read_event(self, room_id, event_id):
+        self.actions.append(('read_event', room_id))
+        if self.read_results:
+            result = self.read_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
         return copy.deepcopy(self.events[room_id, event_id])
 
 
@@ -1136,6 +1158,79 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(self.bot.send_attempts[-1][0], fallback)
         self.assertIn('nicht Ende-zu-Ende-verschlüsselten Raum',
                       self.bot.send_attempts[-1][2])
+        self.assertEqual(self.bot.rejected_invitations, [invited])
+        self.assertLess(self.bot.actions.index(('send_message', fallback)),
+                        self.bot.actions.index(('read_event', fallback)))
+        self.assertLess(self.bot.actions.index(('read_event', fallback)),
+                        self.bot.actions.index(('reject_invitation', invited)))
+        self.assertEqual(self.state.snapshot()['since'], 's1')
+
+    def test_existing_unencrypted_subscription_suppresses_notice_and_rejects_old_invite(self):
+        self.state.bootstrap('s0')
+        fallback = '!existing-plain:example.org'
+        invited = '!encrypted-old:example.org'
+        self.bot.states[fallback] = room_state(user_id=ENCRYPTED_USER)
+        self.state.apply_command(
+            '$existing-subscription', 'Digest', ENCRYPTED_USER, fallback)
+        before = self.state.snapshot()['subscriptions']
+        invite = {'invite_state': {'events': [
+            {'type': 'm.room.encryption', 'state_key': '', 'content': {}},
+            {'type': 'm.room.member', 'state_key': BOT, 'sender': ENCRYPTED_USER,
+             'content': {'membership': 'invite'}}]}}
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: invite}}}]
+
+        self.service.poll_once(timeout_ms=0)
+
+        self.assertEqual(self.bot.created_rooms, [])
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.bot.rejected_invitations, [invited])
+        self.assertEqual(self.state.snapshot()['subscriptions'], before)
+        self.assertEqual(self.state.snapshot()['since'], 's1')
+
+    def test_existing_unencrypted_room_without_subscription_also_suppresses_notice(self):
+        self.state.bootstrap('s0')
+        fallback = '!existing-plain-no-subscription:example.org'
+        invited = '!encrypted-old-no-subscription:example.org'
+        self.bot.states[fallback] = room_state(user_id=ENCRYPTED_USER)
+        invite = {'invite_state': {'events': [
+            {'type': 'm.room.encryption', 'state_key': '', 'content': {}},
+            {'type': 'm.room.member', 'state_key': BOT, 'sender': ENCRYPTED_USER,
+             'content': {'membership': 'invite'}}]}}
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: invite}}}]
+
+        self.service.poll_once(timeout_ms=0)
+
+        self.assertEqual(self.bot.created_rooms, [])
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.bot.rejected_invitations, [invited])
+        self.assertEqual(self.state.snapshot()['subscriptions'], {})
+        self.assertEqual(self.state.snapshot()['since'], 's1')
+
+    def test_startup_suppresses_old_encrypted_notice_for_existing_subscription(self):
+        self.state.bootstrap('s0')
+        fallback = '!existing-startup-plain:example.org'
+        invited = '!encrypted-startup-old:example.org'
+        self.bot.states[fallback] = room_state(user_id=ENCRYPTED_USER)
+        self.state.apply_command('$startup-subscription', 'Digest', ENCRYPTED_USER, fallback)
+        before = self.state.snapshot()['subscriptions']
+        self.assertFalse(self.service.bootstrap())
+        invite = {'invite_state': {'events': [
+            {'type': 'm.room.encryption', 'state_key': '', 'content': {}},
+            {'type': 'm.room.member', 'state_key': BOT, 'sender': ENCRYPTED_USER,
+             'content': {'membership': 'invite'}}]}}
+        self.bot.sync_responses = [
+            {'next_batch': 'reconcile', 'rooms': {'invite': {invited: invite}}},
+            {'next_batch': 's1', 'rooms': {}},
+        ]
+
+        self.service.poll_once(timeout_ms=0)
+
+        self.assertEqual(self.bot.created_rooms, [])
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.bot.rejected_invitations, [invited])
+        self.assertEqual(self.state.snapshot()['subscriptions'], before)
         self.assertEqual(self.state.snapshot()['since'], 's1')
 
     def test_startup_reconciles_old_encrypted_invite_without_replaying_history(self):
@@ -1154,6 +1249,7 @@ class DigestTests(unittest.TestCase):
         ]
         self.service.poll_once(timeout_ms=0)
         self.assertEqual(len(self.bot.created_rooms), 1)
+        self.assertEqual(self.bot.rejected_invitations, [invited])
         self.assertEqual(self.state.snapshot()['subscriptions'], {})
         self.assertFalse(self.state.command_completed('$old'))
         self.assertEqual(self.state.snapshot()['since'], 's1')
@@ -1172,6 +1268,7 @@ class DigestTests(unittest.TestCase):
         ]
         self.service.poll_once(timeout_ms=0)
         self.assertEqual(self.bot.joined, [invited])
+        self.assertEqual(self.bot.rejected_invitations, [])
         self.assertEqual(self.state.snapshot()['subscriptions'], {})
         self.assertIn('sende den Befehl bitte hier noch einmal',
                       self.bot.send_attempts[-1][2])
@@ -1198,6 +1295,8 @@ class DigestTests(unittest.TestCase):
         self.service.poll_once(timeout_ms=0)
         self.assertEqual(self.bot.created_rooms, [])
         self.assertEqual(self.bot.send_attempts[-1][0], fallback)
+        self.assertEqual(
+            self.bot.rejected_invitations, ['!encrypted-old:example.org'])
 
     def test_startup_recovers_bot_only_marker_before_any_second_create(self):
         self.state.bootstrap('s0')
@@ -1219,6 +1318,115 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(self.bot.created_rooms, [])
         self.assertEqual(self.bot.invited_users, [(fallback, ENCRYPTED_USER)])
         self.assertEqual(self.bot.send_attempts[-1][0], fallback)
+        self.assertEqual(
+            self.bot.rejected_invitations, ['!encrypted-old:example.org'])
+
+    def test_notice_readback_failure_does_not_reject_invite_or_advance_cursor(self):
+        self.state.bootstrap('s0')
+        invited = '!encrypted-readback:example.org'
+        invite = {'invite_state': {'events': [
+            {'type': 'm.room.encryption', 'state_key': '', 'content': {}},
+            {'type': 'm.room.member', 'state_key': BOT, 'sender': ENCRYPTED_USER,
+             'content': {'membership': 'invite'}}]}}
+        self.bot.read_results = [MatrixError('matrix_network_error')]
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: invite}}}]
+
+        with self.assertRaisesRegex(MatrixError, 'matrix_network_error'):
+            self.service.poll_once(timeout_ms=0)
+
+        self.assertEqual(len(self.bot.created_rooms), 1)
+        self.assertEqual(self.bot.rejected_invitations, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+        self.bot.sync_responses = [
+            {'next_batch': 's2', 'rooms': {'invite': {invited: invite}}}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(len(self.bot.created_rooms), 1)
+        self.assertEqual(len(self.bot.transactions), 1)
+        self.assertEqual(self.bot.rejected_invitations, [invited])
+        self.assertEqual(self.state.snapshot()['since'], 's2')
+
+    def test_reject_failure_retries_without_second_visible_notice_or_room(self):
+        self.state.bootstrap('s0')
+        invited = '!encrypted-retry:example.org'
+        invite = {'invite_state': {'events': [
+            {'type': 'm.room.encryption', 'state_key': '', 'content': {}},
+            {'type': 'm.room.member', 'state_key': BOT, 'sender': ENCRYPTED_USER,
+             'content': {'membership': 'invite'}}]}}
+        self.bot.reject_results = [MatrixError('matrix_network_error'), True]
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: invite}}}]
+
+        with self.assertRaisesRegex(MatrixError, 'matrix_network_error'):
+            self.service.poll_once(timeout_ms=0)
+
+        fallback = self.bot.created_rooms[0][2]
+        first_transaction = self.bot.send_attempts[-1][1]
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+        self.bot.sync_responses = [
+            {'next_batch': 's2', 'rooms': {'invite': {invited: invite}}}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(len(self.bot.created_rooms), 1)
+        self.assertEqual([attempt[1] for attempt in self.bot.send_attempts],
+                         [first_transaction, first_transaction])
+        self.assertEqual(len(self.bot.events), 1)
+        self.assertIn((fallback, self.bot.transactions[first_transaction]), self.bot.events)
+        self.assertEqual(self.bot.rejected_invitations, [invited, invited])
+        self.assertEqual(self.state.snapshot()['since'], 's2')
+
+    def test_ambiguous_reject_already_applied_needs_no_second_action(self):
+        self.state.bootstrap('s0')
+        invited = '!encrypted-ambiguous-applied:example.org'
+        invite = {'invite_state': {'events': [
+            {'type': 'm.room.encryption', 'state_key': '', 'content': {}},
+            {'type': 'm.room.member', 'state_key': BOT, 'sender': ENCRYPTED_USER,
+             'content': {'membership': 'invite'}}]}}
+        self.bot.reject_results = [MatrixError('matrix_network_error')]
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: invite}}}]
+
+        with self.assertRaisesRegex(MatrixError, 'matrix_network_error'):
+            self.service.poll_once(timeout_ms=0)
+
+        self.assertEqual(len(self.bot.send_attempts), 1)
+        self.assertEqual(self.bot.rejected_invitations, [invited])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+        # The lost response was ambiguous, but the next sync proves that the
+        # homeserver applied the leave and no longer reports the invitation.
+        self.bot.sync_responses = [{'next_batch': 's2', 'rooms': {}}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(len(self.bot.send_attempts), 1)
+        self.assertEqual(self.bot.rejected_invitations, [invited])
+        self.assertEqual(self.state.snapshot()['since'], 's2')
+
+    def test_reject_retry_never_warns_existing_unencrypted_subscriber(self):
+        self.state.bootstrap('s0')
+        fallback = '!existing-retry-plain:example.org'
+        invited = '!encrypted-existing-retry:example.org'
+        self.bot.states[fallback] = room_state(user_id=ENCRYPTED_USER)
+        self.state.apply_command('$retry-subscription', 'Digest', ENCRYPTED_USER, fallback)
+        invite = {'invite_state': {'events': [
+            {'type': 'm.room.encryption', 'state_key': '', 'content': {}},
+            {'type': 'm.room.member', 'state_key': BOT, 'sender': ENCRYPTED_USER,
+             'content': {'membership': 'invite'}}]}}
+        self.bot.reject_results = [MatrixError('matrix_network_error'), True]
+        self.bot.sync_responses = [
+            {'next_batch': 's1', 'rooms': {'invite': {invited: invite}}}]
+
+        with self.assertRaisesRegex(MatrixError, 'matrix_network_error'):
+            self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.state.snapshot()['since'], 's0')
+
+        self.bot.sync_responses = [
+            {'next_batch': 's2', 'rooms': {'invite': {invited: invite}}}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.bot.rejected_invitations, [invited, invited])
+        self.assertEqual(self.state.snapshot()['since'], 's2')
 
     def test_encrypted_group_invite_with_third_invitee_creates_no_fallback(self):
         self.state.bootstrap('s0')
@@ -1233,6 +1441,27 @@ class DigestTests(unittest.TestCase):
         self.service.poll_once(timeout_ms=0)
         self.assertEqual(self.bot.created_rooms, [])
         self.assertEqual(self.bot.send_attempts, [])
+        self.assertEqual(self.bot.rejected_invitations, [])
+
+    def test_multiple_encrypted_invites_from_same_user_send_one_notice_and_reject_both(self):
+        self.state.bootstrap('s0')
+
+        def encrypted_invite():
+            return {'invite_state': {'events': [
+                {'type': 'm.room.encryption', 'state_key': '', 'content': {}},
+                {'type': 'm.room.member', 'state_key': BOT, 'sender': ENCRYPTED_USER,
+                 'content': {'membership': 'invite'}}]}}
+
+        self.bot.sync_responses = [{'next_batch': 's1', 'rooms': {'invite': {
+            '!encrypted-a:example.org': encrypted_invite(),
+            '!encrypted-b:example.org': encrypted_invite(),
+        }}}]
+        self.service.poll_once(timeout_ms=0)
+        self.assertEqual(len(self.bot.created_rooms), 1)
+        self.assertEqual(len(self.bot.send_attempts), 1)
+        self.assertEqual(self.bot.rejected_invitations, [
+            '!encrypted-a:example.org', '!encrypted-b:example.org'])
+        self.assertEqual(self.state.snapshot()['since'], 's1')
 
     def test_only_one_fallback_is_created_per_pass_and_retry_reconciles(self):
         self.state.bootstrap('s0')
@@ -1253,10 +1482,14 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(len(self.bot.created_rooms), 1)
         self.assertEqual(self.state.snapshot()['since'], 's0')
 
-        response['next_batch'] = 's2'
-        self.bot.sync_responses = [response]
+        retry = {'next_batch': 's2', 'rooms': {'invite': {
+            '!b-encrypted:example.org': encrypted_invite(SECOND_ENCRYPTED_USER),
+        }}}
+        self.bot.sync_responses = [retry]
         self.service.poll_once(timeout_ms=0)
         self.assertEqual(len(self.bot.created_rooms), 2)
+        self.assertEqual(self.bot.rejected_invitations, [
+            '!a-encrypted:example.org', '!b-encrypted:example.org'])
         self.assertEqual(self.state.snapshot()['since'], 's2')
 
     def test_fallback_validation_rejects_unsafe_state_marker_creator_and_members(self):

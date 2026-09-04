@@ -727,6 +727,9 @@ class DigestService:
                 marked_rooms.append(room_id)
             except DigestServiceError:
                 pass
+        # A joined peer makes the unencrypted route immediately usable.  This
+        # deliberately takes precedence even for a marker-bearing legacy
+        # fallback, so old E2EE invitations cannot trigger warning spam.
         if safe_rooms:
             return safe_rooms[0], False
         if len(marked_rooms) > 1:
@@ -754,13 +757,17 @@ class DigestService:
             elif memberships[user_id] not in ('invite', 'join'):
                 raise DigestServiceError('digest_fallback_target_inactive')
             _validate_fallback_room(self.bot, room_id, user_id, target_sha256)
+            transaction = 'digest-e2ee-fallback-' + target_sha256[:40]
+            sent = self.bot.send_message(
+                DIGEST_FALLBACK_NOTICE, room_id=room_id, transaction_id=transaction)
+            self._verify_text(room_id, sent, DIGEST_FALLBACK_NOTICE)
+            logger.info('Unverschlüsselter privater Ersatzraum für Digest-Einladung bestätigt.')
         else:
+            # A fully joined, safe two-person room already gives the sender a
+            # readable command path.  Repeating the E2EE warning there would be
+            # both misleading and noisy.
             validate_digest_room(self.bot, room_id, user_id)
-        transaction = 'digest-e2ee-fallback-' + target_sha256[:40]
-        sent = self.bot.send_message(
-            DIGEST_FALLBACK_NOTICE, room_id=room_id, transaction_id=transaction)
-        self._verify_text(room_id, sent, DIGEST_FALLBACK_NOTICE)
-        logger.info('Unverschlüsselter privater Ersatzraum für Digest-Einladung bestätigt.')
+            logger.info('Vorhandener unverschlüsselter Privatraum bestätigt; kein weiterer Hinweis.')
         return room_id, created
 
     def _join_invitations(self, response):
@@ -769,6 +776,7 @@ class DigestService:
         if not isinstance(invited, dict) or len(invited) > 50:
             raise MatrixError('invalid_sync_response')
         joined, changed, creates = [], False, 0
+        encrypted_targets = set()
         for room_id, room in sorted(invited.items()):
             if not isinstance(room_id, str) or not room_id.startswith('!'):
                 raise MatrixError('invalid_sync_response')
@@ -778,9 +786,12 @@ class DigestService:
                 continue
             sender, encrypted = details
             if encrypted:
-                _fallback, created = self._ensure_fallback_room(
-                    sender, allow_create=creates == 0)
-                creates += int(created)
+                if sender not in encrypted_targets:
+                    _fallback, created = self._ensure_fallback_room(
+                        sender, allow_create=creates == 0)
+                    encrypted_targets.add(sender)
+                    creates += int(created)
+                self.bot.reject_invitation(room_id)
                 changed = True
                 continue
             self.bot.join_room(room_id)

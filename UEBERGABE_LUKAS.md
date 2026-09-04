@@ -93,7 +93,9 @@ geprüftes Bundle aus `YYYY-MM-DD-methoden-digest.md` und
 erzwungenen SSH-Befehl. Beide Dateien werden zusammen mit dem formatierten Digest an
 Abonnierende ausgeliefert. Der Methodenbot unterstützt weiterhin keine
 Ende-zu-Ende-Verschlüsselung; `Digest` funktioniert daher nur in unverschlüsselten
-privaten Zweier-Räumen.
+privaten Zweier-Räumen. Wenn für eine verschlüsselte Einladung bereits ein gültiger
+unverschlüsselter Zweierraum existiert, verwendet der Bot diesen ohne erneuten Hinweis
+und lehnt die alte verschlüsselte Einladung anschließend ab.
 
 ## Prüfen und betreiben
 

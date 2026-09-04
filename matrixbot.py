@@ -420,6 +420,19 @@ class MatrixBot:
             raise MatrixError('matrix_join_unconfirmed')
         return joined
 
+    def reject_invitation(self, room_id):
+        """Reject a pending room invitation without joining the room."""
+        if not isinstance(room_id, str) or not room_id.startswith('!'):
+            raise MatrixError('invalid_matrix_room')
+        # ``leave`` has no transaction identifier.  Do not blindly retry an
+        # ambiguous POST; the next Matrix sync reconciles whether the invite is
+        # still pending.
+        self.request_json(
+            'POST', '/rooms/' + quote(room_id, safe='') + '/leave',
+            payload={}, idempotent=False)
+        logger.info('Verschlüsselte Matrix-Einladung abgelehnt.')
+        return True
+
     def joined_room_ids(self):
         body = self.request_json('GET', '/joined_rooms')
         rooms = body.get('joined_rooms') if isinstance(body, dict) else None

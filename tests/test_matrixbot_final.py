@@ -4,6 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import requests
+
 from matrixbot import DIGEST_FALLBACK_MARKER, MatrixBot, MatrixError
 
 
@@ -42,7 +44,10 @@ class API:
 
             def request(self, method, url, **kwargs):
                 api.requests.append((method, url, kwargs))
-                return api.send_responses.pop(0)
+                result = api.send_responses.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
 
         return Session()
 
@@ -223,6 +228,59 @@ class MatrixFinalTests(unittest.TestCase):
         self.assertEqual(method, 'POST')
         self.assertTrue(url.endswith('/rooms/%21fallback%3Aexample.invalid/invite'))
         self.assertEqual(kwargs['json'], {'user_id': '@reader:example.invalid'})
+
+    def test_encrypted_room_invitation_is_rejected_with_single_leave_post(self):
+        api = API()
+        api.send_responses = [Response(200, {})]
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        self.assertTrue(bot.reject_invitation('!encrypted:example.invalid'))
+        method, url, kwargs = api.requests[-1]
+        self.assertEqual(method, 'POST')
+        self.assertTrue(url.endswith('/rooms/%21encrypted%3Aexample.invalid/leave'))
+        self.assertEqual(kwargs['json'], {})
+        self.assertEqual(len(api.requests), 1)
+
+    def test_invitation_rejection_refreshes_auth_once_after_401(self):
+        api = API()
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        self.assertTrue(bot.reject_invitation('!encrypted:example.invalid'))
+        self.assertEqual(api.logins, 2)
+        self.assertEqual(len(api.requests), 2)
+        self.assertEqual(api.requests[0][1], api.requests[1][1])
+        self.assertEqual(api.requests[0][2]['json'], api.requests[1][2]['json'])
+        self.assertEqual(api.requests[0][2]['headers']['Authorization'], 'Bearer token-1')
+        self.assertEqual(api.requests[1][2]['headers']['Authorization'], 'Bearer token-2')
+
+    def test_invitation_rejection_does_not_blindly_retry_ambiguous_failures(self):
+        failures = [
+            (Response(status, {'errcode': 'M_UNKNOWN'}),
+             'matrix_http_error', status)
+            for status in (500, 502, 503, 504)
+        ] + [
+            (Response(429, {'errcode': 'M_LIMIT_EXCEEDED'},
+                      headers={'Retry-After': '1'}), 'matrix_http_error', 429),
+            (requests.Timeout('ambiguous leave'), 'matrix_network_error', None),
+        ]
+        for failure, expected, status in failures:
+            with self.subTest(expected=expected, status=status):
+                api = API()
+                api.send_responses = [failure]
+                bot = MatrixBot(
+                    self.config(), session_factory=api.factory,
+                    sleep=lambda seconds: None)
+                with self.assertRaisesRegex(MatrixError, expected) as raised:
+                    bot.reject_invitation('!encrypted:example.invalid')
+                self.assertEqual(raised.exception.status, status)
+                self.assertEqual(len(api.requests), 1)
+
+    def test_invitation_rejection_rejects_invalid_room_before_http(self):
+        api = API()
+        bot = MatrixBot(self.config(), session_factory=api.factory, sleep=lambda seconds: None)
+        for room_id in (None, '', 'encrypted:example.invalid'):
+            with self.subTest(room_id=room_id):
+                with self.assertRaisesRegex(MatrixError, 'invalid_matrix_room'):
+                    bot.reject_invitation(room_id)
+        self.assertEqual(api.requests, [])
 
     def test_digest_fallback_room_has_private_marker_and_hardened_power_levels(self):
         api = API()
